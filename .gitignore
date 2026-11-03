@@ -17,5 +17,5 @@ qrcode.txt
 *.tar.gz
 *.zip
 # Old-version rollback copies and service variants from earlier releases.
-bridge.py.v*
-wechat-bridge.service.v*
+/bridge.py.v*
+/wechat-bridge.service.v*

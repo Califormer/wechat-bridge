@@ -12,8 +12,10 @@
 - **不要在 issue、日志、截图里贴凭据**：`bridge.py status`、
   `ops/doctor.py` 输出都是脱敏的；如果你在别处看到完整 token，
   先作废、重新扫码，再报告问题。
-- 发现安全问题：请不要公开开 issue，先通过仓库的私人联系方式
-  告诉维护者，并说明影响范围、复现步骤（不要附凭据）。
+- 发现安全问题：请不要公开开 issue，请通过仓库 Security 标签页的
+  Report a vulnerability（私人漏洞报告）提交，说明影响范围、复现步骤
+  （不要附凭据）。如果该入口不可见，说明维护者尚未开启它，
+  请改走仓库主页上留的其他联系方式并提醒维护者开启。
 
 ## English
 
@@ -30,6 +32,9 @@
 - **Never paste credentials into issues, logs, or screenshots**:
   `bridge.py status` and `ops/doctor.py` outputs are redacted. If you
   see a full token somewhere else, revoke it, re-scan, and then report.
-- If you find a security issue, do not open a public issue. Contact
-  the maintainer privately with the impact and reproduction steps
-  (without credentials).
+- If you find a security issue, do not open a public issue. Use the
+  repository's Security tab, Report a vulnerability (private
+  vulnerability reporting), with the impact and reproduction steps
+  (without credentials). If that entry is not visible, the maintainer
+  has not enabled it yet; use another contact listed on the
+  repository home page and ask them to enable it.

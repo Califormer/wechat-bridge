@@ -1,5 +1,25 @@
 # 更新日志
 
+## v5.0.2（开源包修正，2026-11-03；尚未发布、尚未回灌线上桥）
+
+- `.gitignore` 锚定：`bridge.py.v*` 和 `wechat-bridge.service.v*` 前加 `/`，
+  否则 fresh clone 里 `git add -A` 会漏掉 `tests/fixtures/bridge.py.v1/.v3`
+  （test_offline、test_v4 依赖它们）。GitHub 当前树不受影响（快照推送不走 gitignore），
+  但新贡献者会踩这个坑；CI 里加了 `git ls-files tests/fixtures` 守门。
+- 流式解密：cryptography 后端坏数据抛裸 `ValueError`，文件解密路径没有转成
+  `MediaError("decrypt")`（小数据路径一直会转），导致 FILE_DECRYPT_HINT 不触发、
+  续传后解不开重下分支也走不到。本机复现条件是装了 cryptography（本机默认
+  ctypes 后端所以 v5.0.1 时没测出来）；修法是在文件解密包装器里转换，
+  并在 `_aes_stream` 里统一把填充错误转成 MediaError。
+- 决策文件：运行时决定改写 `state/DECISIONS.md`（已被忽略），仓库里只留
+  `DECISIONS.example.md` 示例；claim 优先读 `state/`，读不到再回退旧位置，
+  已有部署的决定不会丢。
+- 重定向：跨域重定向现在也要过媒体 URL 白名单（同域重定向不变），
+  堵住可信域名上的开放重定向把请求带到任意 https 主机。
+- SECURITY.md：私人联系渠道写明为仓库 Security 标签页的私人漏洞报告。
+- 新增 CI：GitHub Actions 跑全部离线测试（含 e2e）与夹具守门检查。
+
+
 ## v5.0.1（开源包修正，2026-11-03；同日已回灌线上桥）
 
 - 文档：EXECUTOR.md 精简到 8000 字节以下，test_opt6 通过；bridge.py、

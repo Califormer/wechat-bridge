@@ -85,6 +85,18 @@ try:
 except Exception:
     check(True, "AES bad ciphertext rejected")
 
+# 4. File decrypt failure must be MediaError("decrypt") on every backend
+# (cryptography used to leak a raw ValueError here, skipping the
+# FILE_DECRYPT_HINT mapping and the resume-redownload branch).
+d2 = Path(tempfile.mkdtemp(prefix="wb-aes-bad-"))
+(d2 / "bad.bin").write_bytes(os.urandom(4096))
+try:
+    b._decrypt_aes_ecb_file(d2 / "bad.bin", key, d2 / "bad.out")
+    check(False, "file decrypt failure raises")
+except Exception as e:
+    check(isinstance(e, b.MediaError) and getattr(e, "reason", None) == "decrypt",
+          f"file decrypt failure is MediaError decrypt (backend={b._aes_backend()})")
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {fails}")

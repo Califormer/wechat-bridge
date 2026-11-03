@@ -625,7 +625,10 @@ class KeepAliveOpener:
                 new_origin = (new_parts.scheme, new_parts.hostname,
                               new_parts.port)
                 if old_origin != new_origin:
-                    # Never leak caller credentials to another origin.
+                    # Never leak caller credentials to another origin, and
+                    # never let an open redirect on a trusted host carry
+                    # the request to an arbitrary https host.
+                    _validate_server_url(new_url, "redirect")
                     for k in list(headers):
                         if k.lower() in ("authorization", "cookie",
                                          "proxy-authorization"):
@@ -1319,8 +1322,14 @@ def _aes_stream(src: Path, key: bytes, dst: Path, encrypt: bool) -> None:
             if encrypt:
                 out.write(ctx.update(padder.finalize()) + ctx.finalize())
             else:
-                out.write(unpadder.update(ctx.finalize())
-                          + unpadder.finalize())
+                try:
+                    tail = unpadder.update(ctx.finalize()) + unpadder.finalize()
+                except ValueError as e:
+                    raise MediaError(
+                        "decrypt" if not encrypt else "encrypt",
+                        "media decrypt failed" if not encrypt
+                        else "media encrypt failed") from e
+                out.write(tail)
         return
     import ctypes
     lib = _evp_lib()
@@ -2213,7 +2222,8 @@ HISTORY_MAX_BYTES = 1_000_000
 HISTORY_KEEP_LINES = 600
 HISTORY_TEXT_MAX = 1000
 MEMO_FILE = STATE_DIR / "conversation_memo.json"
-DECISIONS_FILE = BASE_DIR / "DECISIONS.md"  # opt batch item 2: per-matter decision list
+DECISIONS_FILE = BASE_DIR / "state" / "DECISIONS.md"  # runtime decisions (gitignored)
+DECISIONS_LEGACY_FILE = BASE_DIR / "DECISIONS.md"  # pre-v5.0.2 location, read-only fallback
 MEMO_MAX_CHARS = 1500
 
 
@@ -2481,7 +2491,9 @@ def conversation_context(before_ms: int | None) -> dict | None:
     if memo:
         out["memo"] = memo
     try:
-        dec = DECISIONS_FILE.read_text(encoding="utf-8")
+        dec = (DECISIONS_FILE.read_text(encoding="utf-8")
+               if DECISIONS_FILE.exists()
+               else DECISIONS_LEGACY_FILE.read_text(encoding="utf-8"))
     except OSError:
         dec = ""
     if dec.strip():
@@ -2981,8 +2993,15 @@ def _fetch_decrypt(url: str, key: bytes, tmp_path: Path, plain_path: Path,
 
 def _decrypt_aes_ecb_file(src: Path, key: bytes, dst: Path) -> None:
     """File-to-file AES-128-ECB decrypt (streaming, so a
-    100MB video never sits in RAM three times over)."""
-    _aes_stream(src, key, dst, False)
+    100MB video never sits in RAM three times over). Raises
+    MediaError("decrypt") on bad ciphertext, like _decrypt_aes_ecb;
+    disk errors (OSError) pass through unchanged."""
+    try:
+        _aes_stream(src, key, dst, False)
+    except (MediaError, OSError):
+        raise
+    except Exception as e:  # noqa: BLE001 - cryptography raises ValueError
+        raise MediaError("decrypt", "media decrypt failed") from e
 
 
 def _md5_file(path: Path) -> str:
@@ -7670,6 +7689,7 @@ def cmd_decisions(args) -> int:
             text = text.replace(marker, entry + marker, 1)
         else:
             text = text.rstrip() + "\n\n## 进行中\n" + entry
+        DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
         DECISIONS_FILE.write_text(text, encoding="utf-8")
         print(json.dumps({"ok": True, "added": item}, ensure_ascii=False))
         return 0
