@@ -223,9 +223,13 @@ try:
     switched = wait_for(lambda: hb().get("transport_mode") == "proxy", 10)
     srv.push("m5", "切到代理之后还能收到吗", "T5")
     got = wait_for(lambda: task("m5")["status"] == "pending_execution", 15)
-    check(switched and got and px.tunnels > 0 and serve.poll() is None and hb().get("serve_pid") == serve.pid,
+    # The switch takes effect on the next poll: a message pushed during
+    # the switch may still be picked up by the in-flight direct poll, so
+    # wait for a proxied poll to register before asserting tunnels > 0.
+    tunneled = wait_for(lambda: px.tunnels > 0, 15)
+    check(switched and got and tunneled and serve.poll() is None and hb().get("serve_pid") == serve.pid,
           f"SIGHUP: serve re-read proxy.env and polls through the proxy ({px.tunnels} tunnel(s)) - same "
-          "process, no restart, no lost first poll")
+          "process, no restart, no lost first poll; proxy takes effect by the next poll cycle")
 finally:
     drain()
     wd = sum(1 for n in notes if "WATCHDOG=1" in n)

@@ -89,7 +89,7 @@ except Exception:
 # (cryptography used to leak a raw ValueError here, skipping the
 # FILE_DECRYPT_HINT mapping and the resume-redownload branch).
 d2 = Path(tempfile.mkdtemp(prefix="wb-aes-bad-"))
-(d2 / "bad.bin").write_bytes(os.urandom(4096))
+(d2 / "bad.bin").write_bytes(b"\x00" * 4096)  # fixed block: pad byte 0x00 is never valid PKCS7
 try:
     b._decrypt_aes_ecb_file(d2 / "bad.bin", key, d2 / "bad.out")
     check(False, "file decrypt failure raises")

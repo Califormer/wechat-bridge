@@ -747,6 +747,39 @@ def _https_proxy_from_env_file() -> str | None:
     return _https_proxy_from(values)
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Mirror the pool's redirect rules for the urllib fallback path
+    (used when the pool is disabled, e.g. https/socks proxies). The
+    stdlib handler copies every header cross-origin, so without this
+    an API Bearer token would leak to the redirect target. Validation
+    failures surface as URLError, which every caller already maps to
+    a network error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if old.scheme == "https" and new.scheme == "http":
+            raise urllib.error.URLError(
+                "refusing https->http redirect downgrade")
+        old_origin = (old.scheme, old.hostname, old.port)
+        new_origin = (new.scheme, new.hostname, new.port)
+        if old_origin != new_origin:
+            try:
+                _validate_server_url(
+                    urllib.parse.urljoin(req.full_url, newurl), "redirect")
+            except MediaError as e:
+                raise urllib.error.URLError(str(e)) from e
+            stripped = {k: req.headers.pop(k) for k in list(req.headers)
+                        if k.lower() in ("authorization", "cookie",
+                                         "proxy-authorization")}
+            try:
+                return super().redirect_request(req, fp, code, msg,
+                                                headers, newurl)
+            finally:
+                req.headers.update(stripped)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class ProxyPool:
     def __init__(self) -> None:
         self.enabled = False
@@ -809,7 +842,8 @@ class ProxyPool:
     def open(self, req, timeout):
         """Drop-in for urllib.request.urlopen with failure accounting."""
         if not self.enabled:
-            return urllib.request.urlopen(req, timeout=timeout)
+            opener = urllib.request.build_opener(_SafeRedirectHandler)
+            return opener.open(req, timeout=timeout)
         opener = self._opener
         try:
             resp = opener.open(req, timeout=timeout)
@@ -2224,6 +2258,22 @@ HISTORY_TEXT_MAX = 1000
 MEMO_FILE = STATE_DIR / "conversation_memo.json"
 DECISIONS_FILE = BASE_DIR / "state" / "DECISIONS.md"  # runtime decisions (gitignored)
 DECISIONS_LEGACY_FILE = BASE_DIR / "DECISIONS.md"  # pre-v5.0.2 location, read-only fallback
+
+
+def _decisions_read() -> str:
+    """Read the decision list: the runtime file first, the legacy repo
+    file as fallback. v5.0.2 wired the fallback into claim only, so
+    `decisions` show printed empty for legacy-only deployments and the
+    first --add seeded the runtime file with just the new entry, after
+    which claim stopped seeing the legacy decisions at all. All three
+    paths (claim, show, --add) use this helper now, and --add seeds the
+    runtime file from the legacy text when it first creates it."""
+    try:
+        if DECISIONS_FILE.exists():
+            return DECISIONS_FILE.read_text(encoding="utf-8")
+        return DECISIONS_LEGACY_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 MEMO_MAX_CHARS = 1500
 
 
@@ -2490,12 +2540,7 @@ def conversation_context(before_ms: int | None) -> dict | None:
     memo = memo_get()
     if memo:
         out["memo"] = memo
-    try:
-        dec = (DECISIONS_FILE.read_text(encoding="utf-8")
-               if DECISIONS_FILE.exists()
-               else DECISIONS_LEGACY_FILE.read_text(encoding="utf-8"))
-    except OSError:
-        dec = ""
+    dec = _decisions_read()
     if dec.strip():
         out["decisions"] = dec[:3000]  # opt batch item 2: decided matters first, do not re-ask
     topics = topic_summaries_read()[-3:]
@@ -7680,7 +7725,7 @@ def cmd_history(args) -> int:
 
 def cmd_decisions(args) -> int:
     """Decision list (opt batch item 2): show, or append one in-progress item."""
-    text = DECISIONS_FILE.read_text(encoding="utf-8") if DECISIONS_FILE.exists() else ""
+    text = _decisions_read()
     if getattr(args, "add", None):
         item = args.add.strip()
         marker = "\n## 已决定"

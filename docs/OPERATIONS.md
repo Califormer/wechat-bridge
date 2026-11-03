@@ -82,3 +82,10 @@ python3 ops/report.py --days 1
   本地测试用 `WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1` 放行回环地址。
 - AES 优先 cryptography，其次系统 libcrypto，都没有才回退 openssl 命令行
   （回退时记警告；生产机建议装 cryptography）。
+
+## SIGHUP 代理切换的生效时机（v5.0.3 起）
+
+- SIGHUP 让 serve 重读 proxy.env，但切换在**下一个轮询周期**才生效：
+  切换那一刻已经在途的长轮询仍走旧连接完成，消息正常投递、不会丢；
+  下一次轮询才走新代理。测试里不要在切换后立刻断言隧道数，
+  应先等一次代理轮询出现。

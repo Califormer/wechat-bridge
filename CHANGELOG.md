@@ -1,5 +1,32 @@
 # 更新日志
 
+## v5.0.3（开源包修正，2026-11-03；尚未发布、尚未回灌线上桥）
+
+- 更正 v5.0.2 的说法：那版的旧决定回退只接进了 claim，`decisions` 显示
+  仍读 state 一处，第一次 `--add` 会只用新条目新建 state 文件，此后
+  claim 见到 state 就不再读旧文件，旧决定等于从执行者上下文里消失
+  （文件还在磁盘上）。本版抽出 `_decisions_read()`，claim、显示、
+  `--add` 三处共用，`--add` 首次建文件时用旧文本做底再追加；
+  新增 tests/test_decisions_migrate_20261103.py。线上桥因回灌时已把
+  旧文件原样复制到 state/，不受此问题影响。
+- urllib 回退路径的重定向防护：池被停用时（https/socks 代理）请求走
+  `urlopen`，默认处理器会把 Authorization 原样带到跨域目标（已用
+  本地 A→B 服务器实测复现）。新增 `_SafeRedirectHandler`，复用池里
+  三条规则（拒 https→http、跨域剥凭据、跨域重过白名单），池的回退
+  分支改走带该处理器的 opener。
+- CI：补上漏跑的 test_opt_20261102、test_opt6b_20261102（CHANGELOG
+  原先"全部离线测试"不准确）；测试分两遍跑，一遍装 cryptography、
+  一遍不装（上轮 bug 只在装了时出现）；补 `permissions: contents: read`
+  与 `timeout-minutes`。
+- 测试稳定性：test_open_fixes 的坏密文改成固定全零块（原来 urandom
+  4096 字节有 1/256 概率最后一字节恰为 0x01、填充合法而误报）；
+  test_v5_e2e 的 SIGHUP 检查改为送达后再等一个代理隧道出现（切换
+  本身在下一个轮询周期才生效，切换中途的消息由在途直连轮询接走
+  是正常现象，不应判失败）。
+- SIGHUP 语义说明：切换在下一个轮询周期生效，切换中途到达的消息
+  仍由在途轮询正常投递，不会丢。
+
+
 ## v5.0.2（开源包修正，2026-11-03；同日已发布并回灌线上桥）
 
 - `.gitignore` 锚定：`bridge.py.v*` 和 `wechat-bridge.service.v*` 前加 `/`，
