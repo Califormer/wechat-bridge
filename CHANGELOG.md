@@ -1,6 +1,6 @@
 # 更新日志
 
-## v5.0.1（开源包修正，2026-11-03；尚未回灌线上桥）
+## v5.0.1（开源包修正，2026-11-03；同日已回灌线上桥）
 
 - 文档：EXECUTOR.md 精简到 8000 字节以下，test_opt6 通过；bridge.py、
   backup.sh、recover.sh、服务模板里残留的 OPS.md 引用改到 docs/OPERATIONS.md。
@@ -17,6 +17,8 @@
   此前它按旧默认期待原生语音，与语音发文件卡片的默认行为矛盾。
 - 服务模板：User=USERNAME（不再默认 root）、MemoryMax=2G、RestartSec=5、
   WantedBy=multi-user.target。
+- 回灌说明：线上桥服务单元只放宽 MemoryMax/RestartSec，仍跑在 root 下、
+  WantedBy 不变（hook 重启需要）；线上 OPS/DECISIONS 历史文档未动。
 
 
 ## v5.0（当前版本）
