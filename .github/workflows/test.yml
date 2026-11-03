@@ -1,0 +1,28 @@
+name: offline tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fixtures are tracked (gitignore must not exclude them)
+        run: |
+          git ls-files tests/fixtures | grep -q 'bridge.py.v1'
+          git ls-files tests/fixtures | grep -q 'bridge.py.v3'
+      - name: Syntax check
+        run: |
+          python3 -m py_compile bridge.py ops/*.py
+          for f in ops/*.sh hooks/*.sh; do bash -n "$f"; done
+      - name: Offline regression suite
+        run: |
+          for t in test_v3 test_v4 test_v5 test_offline test_resume test_round2 \
+                   test_hook test_watchdog test_opt6_20261102 test_proxy_failover \
+                   test_serve_e2e test_v4_e2e test_v5_e2e test_open_fixes_20261103; do
+            echo "=== $t ==="
+            python3 "tests/$t.py"
+          done
