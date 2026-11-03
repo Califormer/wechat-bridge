@@ -1,0 +1,44 @@
+# WeChat bridge systemd unit (template).
+# Replace USERNAME with your own username and adjust the paths below
+# to where you cloned this project, then install with:
+#   sudo cp wechat-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wechat-bridge
+[Unit]
+Description=Muse WeChat ClawBot bridge v5 (official openclaw-weixin protocol)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/USERNAME/workspace/wechat-bridge/state/credentials.json
+# Never give up restarting: a rate-limit stop would silently kill the
+# channel (observed 2026-10-27: crash loop reached 9/10 starts).
+StartLimitIntervalSec=0
+
+[Service]
+# v5: serve reports READY and pings the watchdog from its poll loop (every
+# <=40 s). A wedged process is restarted by systemd itself, even if the hook
+# is down too. `systemctl reload` = SIGHUP = re-read proxy.env, no restart.
+Type=notify
+NotifyAccess=main
+WatchdogSec=180
+TimeoutStartSec=30
+EnvironmentFile=-/home/USERNAME/workspace/wechat-bridge/state/proxy.env
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/USERNAME/workspace/wechat-bridge
+ExecStart=/usr/bin/python3 /home/USERNAME/workspace/wechat-bridge/bridge.py serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+KillMode=control-group
+# Hardening that cannot break the bridge (it only writes under ~/workspace).
+# It still runs as root because the hook installs and restarts this unit;
+# see OPS.md (v5) before adding User=.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LimitNOFILE=4096
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

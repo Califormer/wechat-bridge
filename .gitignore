@@ -1,0 +1,21 @@
+# Runtime state and private data: never commit these.
+state/
+inbox/
+inbox_media/
+inbox_files/
+outbox/
+logs/
+history/
+backups/
+icloud-upload/
+archive-old-versions/
+vendor/
+__pycache__/
+qrcode.png
+qrcode.txt
+*.tmp*
+*.tar.gz
+*.zip
+# Old-version rollback copies and service variants from earlier releases.
+bridge.py.v*
+wechat-bridge.service.v*

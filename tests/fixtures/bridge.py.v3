@@ -1,0 +1,3332 @@
+#!/usr/bin/env python3
+"""
+Muse <-> WeChat ClawBot bridge, implementing Tencent's official
+openclaw-weixin backend protocol directly (no OpenClaw runtime, no model).
+
+Protocol source (verified 2026-10-27 against the live repo):
+  - https://github.com/tencent/openclaw-weixin  (plugin version 2.4.10)
+  - docs/protocol_zh_CN.md, src/api/api.ts, src/auth/login-qr.ts,
+    src/monitor/monitor.ts, src/api/session-guard.ts, src/messaging/send.ts
+
+Base URL : https://ilinkai.weixin.qq.com
+QR login : POST /ilink/bot/get_bot_qrcode?bot_type=3
+           GET  /ilink/bot/get_qrcode_status?qrcode=...
+Updates  : POST /ilink/bot/getupdates     (long-poll, get_updates_buf cursor)
+Send     : POST /ilink/bot/sendmessage
+Lifecycle: POST /ilink/bot/msg/notifystart | notifystop
+
+This program only transports messages and manages task state.
+It never generates task answers itself. Tasks are claimed and executed
+by a Muse agent (woken by a Muse hook), which calls `complete`
+with the real result; this program then sends that result to WeChat.
+
+Commands: login, wait-login, serve, send, send-image, send-file, flush, status,
+          claim, complete, stop
+"""
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import errno
+import http.client
+import io
+import itertools
+import json
+import os
+import queue
+import random
+import re
+import secrets
+import select
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+STATE_DIR = BASE_DIR / "state"
+INBOX_DIR = BASE_DIR / "inbox"
+MEDIA_DIR = BASE_DIR / "inbox_media"
+FILES_DIR = BASE_DIR / "inbox_files"
+OUTBOX_DIR = BASE_DIR / "outbox"
+LOG_DIR = BASE_DIR / "logs"
+CREDS_FILE = STATE_DIR / "credentials.json"
+CURSOR_FILE = STATE_DIR / "cursor.json"
+SESSION_FILE = STATE_DIR / "session.json"
+LOGIN_FILE = STATE_DIR / "login_session.json"
+LOGIN_STATUS_FILE = STATE_DIR / "login_status.json"
+HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+PID_FILE = STATE_DIR / "serve.pid"
+LOCK_FILE = STATE_DIR / "tasks.lock"
+QR_PNG = BASE_DIR / "qrcode.png"
+QR_TXT = BASE_DIR / "qrcode.txt"
+
+FIXED_BASE_URL = "https://ilinkai.weixin.qq.com"
+DEFAULT_BASE_URL = FIXED_BASE_URL
+BOT_TYPE = "3"
+CHANNEL_VERSION = "2.4.10"          # matches current plugin package.json
+ILINK_APP_ID = "bot"                # package.json ilink_appid
+BOT_AGENT = "Muse/1.0"              # observability only, not auth
+LONG_POLL_DEFAULT_MS = 35_000
+STALE_ERRCODE = -14                 # session-guard.ts: pause 1 hour
+SESSION_PAUSE_MS = 60 * 60 * 1000
+MAX_CONSECUTIVE_FAILURES = 3
+# Graduated poll-retry delays (seconds): getUpdates is idempotent, so
+# retry fast and cap low - a long backoff only adds recovery latency
+# when an upstream flap ends.
+POLL_RETRY_DELAYS_SEC = (2, 3, 5, 10, 15)
+# Business-error retry in receiver_loop (previously referenced but
+# never defined, which would crash serve on a non--14 getUpdates error).
+UNSUPPORTED_TEXT = "这条通道暂时没有配置这类内容处理，请先用文字描述。"
+
+# Task statuses: received -> pending_execution -> executing ->
+#                waiting_send -> sending -> sent | send_failed | send_uncertain
+#                executing -> execution_failed (still reported to user)
+
+
+def client_version_number() -> int:
+    major, minor, patch = (int(p) for p in CHANNEL_VERSION.split("."))
+    return ((major & 0xFF) << 16) | ((minor & 0xFF) << 8) | (patch & 0xFF)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def log(msg: str) -> None:
+    """Log without tokens or message content. Rotates at ~5 MB."""
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = LOG_DIR / "bridge.log"
+        try:
+            if log_file.stat().st_size > 5_000_000:
+                os.replace(log_file, LOG_DIR / "bridge.log.1")
+        except OSError:
+            pass
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line, flush=True)
+
+
+_tmp_seq = itertools.count()
+
+
+def atomic_write_json(path: Path, data, mode=0o600, fsync: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The tmp name is unique per process+thread+call. It used to be per
+    # process only, so the receiver and sender threads both rewriting
+    # heartbeat.json shared one tmp file and could corrupt each other or
+    # crash os.replace with FileNotFoundError (which killed serve).
+    tmp = path.with_suffix(
+        path.suffix + f".tmp{os.getpid()}.{threading.get_ident()}.{next(_tmp_seq)}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def read_json(path: Path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+@contextlib.contextmanager
+def task_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def mask(value: str | None) -> str:
+    if not value:
+        return "(none)"
+    if len(value) <= 10:
+        return "***"
+    return f"{value[:6]}...{value[-2:]}"
+
+
+# --------------------------------------------------------------------------
+# HTTP layer (faithful to src/api/api.ts)
+# --------------------------------------------------------------------------
+
+def random_wechat_uin() -> str:
+    uint32 = int.from_bytes(secrets.token_bytes(4), "big")
+    return base64.b64encode(str(uint32).encode()).decode()
+
+
+def common_headers() -> dict:
+    return {
+        "iLink-App-Id": ILINK_APP_ID,
+        "iLink-App-ClientVersion": str(client_version_number()),
+    }
+
+
+def post_headers(token: str | None = None, with_auth_type: bool = True) -> dict:
+    h = {"Content-Type": "application/json", **common_headers()}
+    if with_auth_type:
+        h["AuthorizationType"] = "ilink_bot_token"
+        h["X-WECHAT-UIN"] = random_wechat_uin()
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+def base_info() -> dict:
+    return {"channel_version": CHANNEL_VERSION, "bot_agent": BOT_AGENT}
+
+
+class ApiError(Exception):
+    def __init__(self, kind: str, message: str, code=None):
+        super().__init__(message)
+        # http | connect | network | timeout | business
+        #   connect : failed before the request left this host (DNS, TCP,
+        #             proxy CONNECT, TLS, writing it) -> never received
+        #   network : failed after the request was (possibly) sent
+        #   timeout : sent, but no response in time
+        self.kind = kind
+        self.code = code        # business ret/errcode when known
+
+
+# --------------------------------------------------------------------------
+# Transport: keep-alive connections, split timeouts, egress proxy failover
+# --------------------------------------------------------------------------
+# urllib opened a new connection for every request (it even sends
+# "Connection: close"): TCP to the proxy, CONNECT, then a TLS handshake -
+# several cross-border round trips in front of every long poll, every reply
+# part and every presence/typing call. The community iLink clients all reuse
+# connections (Go net/http in lib-x/ilink, reqwest in ilink-hub and
+# wechat-ilink, the shared httpx client in wechat-clawbot); KeepAliveOpener
+# does the same with the standard library only.
+#
+# Timeouts are split: connecting (TCP + CONNECT + TLS) gets
+# CONNECT_TIMEOUT_SEC, the response gets the caller's timeout. urllib used one
+# 45 s timeout for both, and a connect-phase timeout came back as "timeout",
+# which get_updates treats as a normal empty long poll: a black-holed proxy
+# looked like a healthy, quiet channel (the heartbeat kept advancing and the
+# hook never noticed). Failures before the request left this host are now
+# ConnectPhaseError -> ApiError kind "connect", which also tells the send
+# path that the server cannot have received the message.
+
+CONNECT_TIMEOUT_SEC = 12
+POOL_MAX_IDLE_PER_HOST = 4
+# Idle connections are reused only while this fresh. Idempotent requests are
+# retried once on a new connection if a reused one turns out to be dead;
+# sendmessage is not, so it only takes very warm connections.
+IDLE_REUSE_MAX_SEC = 50
+IDLE_REUSE_MAX_SEC_UNSAFE = 8
+UPLOAD_BLOCKSIZE = 64 * 1024
+_DEFAULT_UA = f"Python-urllib/{sys.version_info[0]}.{sys.version_info[1]}"
+_NET_STATS = {"connects": 0, "reused": 0, "stale_retries": 0}
+
+
+class ConnectPhaseError(urllib.error.URLError):
+    """The request never left this host (DNS, TCP, proxy CONNECT, TLS, or
+    writing the request failed): the server cannot have processed it."""
+
+
+def _ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context()
+
+
+def _conn_dropped(conn) -> bool:
+    """True if an idle keep-alive connection is unusable: the peer closed it
+    (EOF) or sent bytes nobody asked for."""
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        return True
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not readable:
+        return False
+    prev = sock.gettimeout()
+    try:
+        sock.settimeout(0.0)
+        sock.recv(1)
+        return True
+    except (ssl.SSLWantReadError, BlockingIOError):
+        return False            # only TLS housekeeping (session tickets)
+    except OSError:
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            sock.settimeout(prev)
+
+
+class _PooledResponse:
+    """urlopen-style response. The connection goes back to the pool once the
+    body has been read completely; otherwise it is closed."""
+
+    def __init__(self, resp, conn, owner, key, url):
+        self._resp, self._conn, self._owner, self._key = resp, conn, owner, key
+        self.status = self.code = resp.status
+        self.reason = resp.reason
+        self.headers = self.msg = resp.headers
+        self.url = url
+
+    def read(self, amt=None):
+        return self._resp.read() if amt is None else self._resp.read(amt)
+
+    def getheader(self, name, default=None):
+        return self._resp.getheader(name, default)
+
+    def getcode(self):
+        return self.status
+
+    def close(self):
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        resp = self._resp
+        if not resp.isclosed() and resp.length == 0:
+            with contextlib.suppress(Exception):
+                resp.read()
+        if resp.isclosed() and not resp.will_close:
+            self._owner._release(self._key, conn)
+        else:
+            with contextlib.suppress(Exception):
+                resp.close()
+            conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class KeepAliveOpener:
+    """`.open(req, timeout)` with urlopen semantics that keeps connections
+    alive, through one HTTP proxy (CONNECT for https, absolute-form for
+    http) or directly. A connection serves one request at a time."""
+
+    def __init__(self, proxy_url: str | None = None):
+        self.proxy_host = self.proxy_port = self.proxy_auth = None
+        if proxy_url:
+            p = urllib.parse.urlsplit(proxy_url)
+            self.proxy_host = p.hostname
+            self.proxy_port = p.port or 80
+            if p.username is not None:
+                raw = (urllib.parse.unquote(p.username) + ":"
+                       + urllib.parse.unquote(p.password or ""))
+                self.proxy_auth = "Basic " + base64.b64encode(
+                    raw.encode()).decode()
+        self._idle: dict = {}
+        self._lock = threading.Lock()
+
+    def _acquire(self, key, max_idle):
+        now = time.monotonic()
+        with self._lock:
+            idle = self._idle.get(key) or []
+            while idle:
+                conn, since = idle.pop()
+                if now - since <= max_idle and not _conn_dropped(conn):
+                    return conn
+                conn.close()
+        return None
+
+    def _release(self, key, conn) -> None:
+        with self._lock:
+            idle = self._idle.setdefault(key, [])
+            idle.append((conn, time.monotonic()))
+            while len(idle) > POOL_MAX_IDLE_PER_HOST:
+                idle.pop(0)[0].close()
+
+    def close_idle(self) -> None:
+        with self._lock:
+            conns = [c for idle in self._idle.values() for c, _ in idle]
+            self._idle.clear()
+        for c in conns:
+            with contextlib.suppress(Exception):
+                c.close()
+
+    def _new_conn(self, scheme, host, port, direct):
+        if scheme == "https":
+            if direct:
+                conn = http.client.HTTPSConnection(host, port,
+                                                   context=_ssl_context())
+            else:
+                conn = http.client.HTTPSConnection(
+                    self.proxy_host, self.proxy_port, context=_ssl_context())
+                conn.set_tunnel(host, port, headers=(
+                    {"Proxy-Authorization": self.proxy_auth}
+                    if self.proxy_auth else None))
+        elif direct:
+            conn = http.client.HTTPConnection(host, port)
+        else:
+            conn = http.client.HTTPConnection(self.proxy_host, self.proxy_port)
+        conn.blocksize = UPLOAD_BLOCKSIZE
+        return conn
+
+    def open(self, req, timeout=None):
+        timeout = timeout or 60
+        url = req.full_url
+        parts = urllib.parse.urlsplit(url)
+        scheme = (parts.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            raise urllib.error.URLError(f"unsupported scheme: {scheme}")
+        host = parts.hostname or ""
+        port = parts.port or (443 if scheme == "https" else 80)
+        direct = (not self.proxy_host
+                  or bool(urllib.request.proxy_bypass(host)))
+        if scheme == "http" and not direct:
+            target = url                     # absolute-form, forward proxy
+        else:
+            target = (parts.path or "/") + (
+                f"?{parts.query}" if parts.query else "")
+        method = req.get_method()
+        data = req.data
+        headers = dict(req.header_items())
+        present = {k.lower() for k in headers}
+        if "user-agent" not in present:
+            headers["User-Agent"] = _DEFAULT_UA
+        if data is not None and "content-type" not in present:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if scheme == "http" and not direct and self.proxy_auth:
+            headers["Proxy-Authorization"] = self.proxy_auth
+        idempotent = getattr(req, "idempotent", method in ("GET", "HEAD"))
+        key = (scheme, host, port, direct)
+        max_idle = (IDLE_REUSE_MAX_SEC if idempotent
+                    else IDLE_REUSE_MAX_SEC_UNSAFE)
+        for attempt in (0, 1):
+            conn = self._acquire(key, max_idle) if attempt == 0 else None
+            reused = conn is not None
+            if attempt and hasattr(data, "seek"):
+                data.seek(0)
+            if conn is None:
+                conn = self._new_conn(scheme, host, port, direct)
+                conn.timeout = min(CONNECT_TIMEOUT_SEC, timeout)
+                try:
+                    conn.connect()
+                except (OSError, http.client.HTTPException) as e:
+                    conn.close()
+                    raise ConnectPhaseError(e) from e
+                _NET_STATS["connects"] += 1
+            else:
+                _NET_STATS["reused"] += 1
+            try:
+                conn.sock.settimeout(timeout)
+                conn.request(method, target, body=data, headers=headers)
+            except (OSError, http.client.HTTPException) as e:
+                conn.close()
+                if reused and attempt == 0:
+                    # Writing failed, so the request cannot have been
+                    # processed: even sendmessage may go again, fresh.
+                    _NET_STATS["stale_retries"] += 1
+                    continue
+                raise ConnectPhaseError(e) from e
+            try:
+                resp = conn.getresponse()
+            except (ConnectionResetError, BrokenPipeError,
+                    ConnectionAbortedError):
+                # incl. RemoteDisconnected: a reused connection the peer had
+                # already dropped. Only idempotent requests may retry.
+                conn.close()
+                if reused and attempt == 0 and idempotent:
+                    _NET_STATS["stale_retries"] += 1
+                    continue
+                raise
+            except BaseException:
+                conn.close()
+                raise
+            break
+        pooled = _PooledResponse(resp, conn, self, key, url)
+        if (resp.status in (301, 302, 303, 307, 308)
+                and method in ("GET", "HEAD")):
+            location = resp.getheader("Location")
+            hops = getattr(req, "_redirects", 0)
+            with contextlib.suppress(Exception):
+                pooled.read()
+            pooled.close()
+            if location and hops < 4:
+                nxt = urllib.request.Request(
+                    urllib.parse.urljoin(url, location),
+                    headers=dict(req.header_items()), method=method)
+                nxt._redirects = hops + 1
+                nxt.idempotent = True
+                return self.open(nxt, timeout)
+        if resp.status >= 300:
+            try:
+                body = pooled.read(1 << 20)
+            except Exception:  # noqa: BLE001
+                body = b""
+            pooled.close()
+            raise urllib.error.HTTPError(url, resp.status, resp.reason,
+                                         resp.headers, io.BytesIO(body))
+        return pooled
+
+
+# Egress proxy pool: fail over between candidate proxies. The active proxy
+# is the one from the environment (state/proxy.env via systemd), exactly as
+# before. After PROXY_ROTATE_AFTER consecutive transport failures a
+# background thread probes the alternatives and switches only if one of them
+# can actually reach the WeChat endpoint, so an upstream blip that every
+# proxy shares does not cause flapping. Alternatives, in probe order:
+#   1. the current value in state/proxy.env (the hook refreshes it)
+#   2. state/proxy-candidates.txt (optional, one URL per line)
+#   3. state/proxy_pool.json (recently used proxies, newest first)
+# Proxy URLs can carry credentials: they are never logged (only a short
+# hash), and both state files are 0600 and excluded from backups.
+
+PROXY_POOL_FILE = STATE_DIR / "proxy_pool.json"
+PROXY_CANDIDATES_FILE = STATE_DIR / "proxy-candidates.txt"
+PROXY_ROTATE_AFTER = 3
+PROXY_ROTATE_COOLDOWN_SEC = 30
+PROXY_PROBE_TIMEOUT_SEC = 6
+PROXY_PROBE_MAX = 3
+PROXY_HISTORY_MAX = 4
+_URL_RE = re.compile(r"\w+://\S+")
+_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
+
+
+def _proxy_id(url: str | None) -> str:
+    return hashlib.sha256((url or "").encode()).hexdigest()[:6]
+
+
+def _proxy_url_ok(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
+def _scrub(text) -> str:
+    """Exception text made safe for the log: no URLs/IPs, bounded length."""
+    return _IP_RE.sub("<ip>", _URL_RE.sub("<url>", str(text)))[:100]
+
+
+def net_detail(e: BaseException) -> str:
+    """Layer of a transport failure, like upstream classifyFetchError
+    (dns / tcp / tls / timeout) plus proxy-specific classes, URL-free."""
+    r = getattr(e, "reason", None)
+    inner = r if isinstance(r, BaseException) else e
+    if isinstance(inner, socket.gaierror):
+        cls = "dns"
+    elif isinstance(inner, ConnectionRefusedError):
+        cls = "refused"
+    elif isinstance(inner, TimeoutError):
+        cls = "timeout"
+    elif isinstance(inner, ssl.SSLError):
+        cls = "tls"
+    elif isinstance(inner, http.client.RemoteDisconnected):
+        cls = "closed"
+    elif isinstance(inner, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError)):
+        cls = "reset"
+    elif isinstance(inner, OSError) and "Tunnel connection failed" in str(inner):
+        cls = "tunnel"
+    elif isinstance(inner, OSError) and inner.errno in (errno.ENETUNREACH,
+                                                        errno.EHOSTUNREACH):
+        cls = "unreachable"
+    elif isinstance(inner, http.client.HTTPException):
+        cls = "protocol"
+    else:
+        cls = "other"
+    return f"{cls}({type(inner).__name__}: {_scrub(inner)})"
+
+
+def _https_proxy_from(mapping) -> str | None:
+    for name in ("https_proxy", "HTTPS_PROXY"):
+        value = (mapping.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _https_proxy_from_env_file() -> str | None:
+    try:
+        text = PROXY_ENV_FILE.read_text(encoding="utf-8")  # defined below
+    except OSError:
+        return None
+    values = {}
+    for line in text.splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and not key.startswith("#"):
+            values[key.strip()] = value.strip().strip("'\"")
+    return _https_proxy_from(values)
+
+
+class ProxyPool:
+    def __init__(self) -> None:
+        self.enabled = False
+        self.active: str | None = None
+        self.rotations = 0
+        self._opener = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._streak = 0
+        self._next_rotation_at = 0.0
+        self._warned_no_alternatives = False
+
+    # -- setup ------------------------------------------------------------
+    def init(self) -> None:
+        """Adopt the environment's https proxy. Without one (or with a
+        scheme urllib cannot speak, e.g. socks) stay disabled and keep the
+        old plain-urlopen behaviour."""
+        url = _https_proxy_from(os.environ)
+        if url and _proxy_url_ok(url):
+            self._activate(url)
+            self.enabled = True
+
+    def start_rotator(self) -> None:
+        if not self.enabled:
+            return
+        self._remember(self.active)
+        update_heartbeat(proxy_id=_proxy_id(self.active), proxy_rotations=0)
+        log(f"proxy pool ready: active={_proxy_id(self.active)} "
+            f"alternatives={len(self._candidates())}")
+        threading.Thread(target=self._rotator_loop, name="proxy-rotator",
+                         daemon=True).start()
+
+    def publish_stats(self) -> None:
+        update_heartbeat(net_connects=_NET_STATS["connects"],
+                         net_reused=_NET_STATS["reused"],
+                         net_stale_retries=_NET_STATS["stale_retries"],
+                         typing_sent=TYPING.sent)
+
+    # -- request path -----------------------------------------------------
+    def open(self, req, timeout):
+        """Drop-in for urllib.request.urlopen with failure accounting."""
+        if not self.enabled:
+            return urllib.request.urlopen(req, timeout=timeout)
+        opener = self._opener
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            self._note_success()  # the server answered through this proxy
+            raise
+        except urllib.error.URLError:
+            self._note_failure()  # connect/tunnel phase, incl. its timeouts
+            raise
+        except TimeoutError:
+            raise  # read-phase timeout: a normal empty long poll
+        except (OSError, http.client.HTTPException):
+            self._note_failure()  # e.g. RemoteDisconnected mid-request
+            raise
+        self._note_success()
+        return resp
+
+    def _note_success(self) -> None:
+        self._streak = 0
+
+    def _note_failure(self) -> None:
+        with self._lock:
+            self._streak += 1
+            due = (self._streak >= PROXY_ROTATE_AFTER
+                   and time.time() >= self._next_rotation_at)
+        if due:
+            self._wake.set()
+
+    # -- failover ---------------------------------------------------------
+    def _activate(self, url: str) -> None:
+        old = self._opener
+        self._opener = KeepAliveOpener(url)
+        self.active = url
+        if old is not None and hasattr(old, "close_idle"):
+            old.close_idle()
+
+    def _history(self) -> list[str]:
+        data = read_json(PROXY_POOL_FILE, {}) or {}
+        return [u for u in (data.get("urls") or [])
+                if isinstance(u, str) and _proxy_url_ok(u)]
+
+    def _remember(self, url: str | None) -> None:
+        if not url:
+            return
+        urls = [url] + [u for u in self._history() if u != url]
+        try:
+            atomic_write_json(PROXY_POOL_FILE,
+                              {"urls": urls[:PROXY_HISTORY_MAX]})
+        except OSError as e:
+            log(f"proxy pool: could not save history: {type(e).__name__}")
+
+    def _candidates(self) -> list[str]:
+        sources = [_https_proxy_from_env_file()]
+        try:
+            for line in PROXY_CANDIDATES_FILE.read_text(
+                    encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    sources.append(line)
+        except OSError:
+            pass
+        sources += self._history()
+        out: list[str] = []
+        for url in sources:
+            if url and _proxy_url_ok(url) and url != self.active \
+                    and url not in out:
+                out.append(url)
+        return out
+
+    def _probe(self, url: str) -> bool:
+        """Can this proxy reach the WeChat endpoint right now? Any HTTP
+        answer counts; only transport failures do not."""
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": url, "https": url}))
+        req = urllib.request.Request(FIXED_BASE_URL + "/", method="HEAD")
+        try:
+            with opener.open(req, timeout=PROXY_PROBE_TIMEOUT_SEC):
+                return True
+        except urllib.error.HTTPError:
+            return True
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            return False
+
+    def _rotate_once(self) -> None:
+        self._next_rotation_at = time.time() + PROXY_ROTATE_COOLDOWN_SEC
+        candidates = self._candidates()
+        if not candidates:
+            if not self._warned_no_alternatives:
+                self._warned_no_alternatives = True
+                log("proxy failover: no alternative proxy configured")
+            return
+        for url in candidates[:PROXY_PROBE_MAX]:
+            if _stop.is_set():
+                return
+            if not self._probe(url):
+                continue
+            old = self.active
+            self._activate(url)
+            self._remember(url)
+            self.rotations += 1
+            self._streak = 0
+            self._next_rotation_at = time.time() + PROXY_ROTATE_COOLDOWN_SEC
+            log(f"proxy failover: {_proxy_id(old)} -> {_proxy_id(url)} "
+                f"(rotations={self.rotations})")
+            update_heartbeat(proxy_id=_proxy_id(url),
+                             proxy_rotations=self.rotations)
+            return
+        log(f"proxy failover: probed {min(len(candidates), PROXY_PROBE_MAX)} "
+            f"alternative(s), none reachable; staying on "
+            f"{_proxy_id(self.active)}")
+
+    def _rotator_loop(self) -> None:
+        while not _stop.is_set():
+            if not self._wake.wait(timeout=1.0):
+                continue
+            self._wake.clear()
+            try:
+                self._rotate_once()
+            except Exception as e:  # noqa: BLE001 - never kill the thread
+                log(f"proxy rotator error: {type(e).__name__}")
+
+
+PROXY_POOL = ProxyPool()
+
+
+def http_post(base_url: str, endpoint: str, body: dict | None,
+              headers: dict, timeout: float) -> dict:
+    url = base_url.rstrip("/") + "/" + endpoint
+    data = json.dumps(body).encode() if body is not None else b""
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    # Only sendmessage must never be repeated blindly; everything else may be
+    # retried on a fresh connection if a reused keep-alive one was stale.
+    req.idempotent = not endpoint.startswith("ilink/bot/sendmessage")
+    try:
+        with PROXY_POOL.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise ApiError("http", f"HTTP {e.code}") from e
+    except TimeoutError as e:
+        raise ApiError("timeout", "request timeout") from e
+    except urllib.error.URLError as e:
+        # urllib wraps everything up to and including writing the request
+        # (ConnectPhaseError is the keep-alive opener's equivalent): the
+        # request never reached the server. This used to map a connect
+        # timeout to "timeout", which get_updates reports as a healthy
+        # empty poll - a black-holed proxy then looked like a quiet channel.
+        raise ApiError("connect", net_detail(e)) from e
+    except (ConnectionError, http.client.HTTPException, OSError) as e:
+        # e.g. http.client.RemoteDisconnected when the peer/proxy closes a
+        # long-held connection: a transient network failure, never fatal.
+        raise ApiError("network", net_detail(e)) from e
+    try:
+        return json.loads(raw) if raw else {}
+    except json.JSONDecodeError as e:
+        raise ApiError("business", "invalid JSON response") from e
+
+
+def http_get(base_url: str, endpoint: str, timeout: float) -> dict:
+    url = base_url.rstrip("/") + "/" + endpoint
+    req = urllib.request.Request(url, headers=common_headers(), method="GET")
+    try:
+        with PROXY_POOL.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise ApiError("http", f"HTTP {e.code}") from e
+    except (TimeoutError, urllib.error.URLError, ConnectionError,
+            http.client.HTTPException, OSError):
+        # login-qr.ts: QR status fetch failures are treated as "wait"
+        return {"status": "wait"}
+    try:
+        return json.loads(raw) if raw else {"status": "wait"}
+    except json.JSONDecodeError:
+        return {"status": "wait"}
+
+
+def load_creds() -> dict | None:
+    creds = read_json(CREDS_FILE)
+    return creds if creds and creds.get("bot_token") else None
+
+
+def api_base(creds: dict | None) -> str:
+    return (creds or {}).get("baseurl") or DEFAULT_BASE_URL
+
+
+def bot_post(creds: dict, endpoint: str, body: dict, timeout: float) -> dict:
+    payload = {**body, "base_info": base_info()}
+    return http_post(api_base(creds), endpoint, payload,
+                     post_headers(token=creds["bot_token"]), timeout)
+
+
+def bot_post_retry(creds: dict, endpoint: str, body: dict, timeout: float,
+                   attempts: int = 2) -> dict:
+    """bot_post for idempotent endpoints: retries transport failures."""
+    for i in range(attempts):
+        try:
+            return bot_post(creds, endpoint, body, timeout)
+        except ApiError as e:
+            if e.kind not in ("connect", "network", "timeout") \
+                    or i == attempts - 1:
+                raise
+            time.sleep(1 + i)
+    raise AssertionError("unreachable")
+
+
+# --------------------------------------------------------------------------
+# WeChat API operations
+# --------------------------------------------------------------------------
+
+def get_updates(creds: dict, cursor: str, timeout_ms: int) -> dict:
+    try:
+        return bot_post(creds, "ilink/bot/getupdates",
+                        {"get_updates_buf": cursor or ""},
+                        timeout=timeout_ms / 1000 + 10)
+    except ApiError as e:
+        if e.kind == "timeout":
+            # api.ts: long-poll client timeout is a normal empty result
+            return {"ret": 0, "msgs": [], "get_updates_buf": cursor}
+        raise
+
+
+def new_client_id() -> str:
+    return f"openclaw-weixin:{now_ms()}-{secrets.token_hex(4)}"
+
+
+def send_text(creds: dict, to_user_id: str, text: str,
+              context_token: str | None, client_id: str | None = None) -> dict:
+    """One single attempt. A timeout is reported as uncertain by the caller;
+    we never silently re-send, to avoid duplicate replies. A resend of the
+    same part reuses the client_id it was first sent with, so a server that
+    de-duplicates by client_id can drop the duplicate."""
+    client_id = client_id or new_client_id()
+    msg = {
+        "from_user_id": "",
+        "to_user_id": to_user_id,
+        "client_id": client_id,
+        "message_type": 2,
+        "message_state": 2,
+        "item_list": [{"type": 1, "text_item": {"text": text}}],
+    }
+    if context_token:
+        msg["context_token"] = context_token
+    resp = bot_post(creds, "ilink/bot/sendmessage", {"msg": msg}, timeout=15)
+    ret = resp.get("ret")
+    if ret not in (None, 0):
+        raise ApiError("business",
+                       f"sendmessage ret={ret} errmsg={resp.get('errmsg')}",
+                       code=ret)
+    resp["_client_id"] = client_id
+    return resp
+
+
+# --------------------------------------------------------------------------
+# Outbound images (official CDN flow, mirroring the inbound side above:
+# docs/protocol.md "CDN media flow" / src/messaging/send.ts /
+# src/cdn/upload.ts / src/cdn/cdn-upload.ts)
+#
+#   1. read file, MD5 + AES-128-ECB padded size
+#   2. POST ilink/bot/getuploadurl (media_type=1 image, no_need_thumb)
+#   3. AES-128-ECB encrypt (openssl CLI; stdlib has no AES), POST the
+#      ciphertext to the CDN URL (upload_full_url preferred, else
+#      <cdn>/upload?encrypted_query_param=<upload_param>&filekey=...)
+#      and read the x-encrypted-param response header
+#   4. sendmessage with a single image item:
+#      type=2, image_item.media={encrypt_query_param, aes_key:
+#      base64(hex key string), encrypt_type:1}, mid_size=ciphertext size
+#      (send.ts encodes the hex key string as base64, not the raw bytes)
+# A caption, if given, is sent first as its own text message, exactly
+# like upstream sendMediaItems. This command does NOT touch task
+# status: an executor sends the image, then still completes the task
+# with text (or vice versa).
+# --------------------------------------------------------------------------
+
+IMAGE_SEND_MAX_BYTES = 10 * 1024 * 1024
+IMAGE_SEND_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+CDN_UPLOAD_MAX_RETRIES = 3
+
+
+def _encrypt_aes_ecb(data: bytes, key: bytes) -> bytes:
+    """AES-128-ECB with PKCS7 padding via openssl (see _decrypt_aes_ecb)."""
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-128-ecb", "-K", key.hex()],
+        input=data, capture_output=True, timeout=30)
+    if proc.returncode != 0:
+        raise ApiError("network", "media encrypt failed")
+    return proc.stdout
+
+
+def _aes_ecb_padded_size(n: int) -> int:
+    return ((n + 1 + 15) // 16) * 16
+
+
+def _cdn_post_bytes(url: str, data: bytes) -> tuple[int, dict, bytes]:
+    """POST raw bytes to the CDN; returns (status, headers, body).
+    HTTP errors are returned, not raised, so the caller can abort on
+    4xx and retry on 5xx/network exactly like upstream cdn-upload.ts."""
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/octet-stream"})
+    try:
+        with PROXY_POOL.open(req, timeout=45) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, dict(e.headers or {}), body
+    except (TimeoutError, urllib.error.URLError, ConnectionError,
+            http.client.HTTPException, OSError) as e:
+        raise ApiError("network", f"CDN upload error: {type(e).__name__}") from e
+
+
+CDN_UPLOAD_TIMEOUT_SEC = 45
+CDN_RETRY_DELAYS_SEC = (1, 3)
+
+
+def _encrypt_aes_ecb_file(src: Path, key: bytes, dst: Path) -> None:
+    """File-to-file AES-128-ECB (PKCS7) via openssl: constant memory."""
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-128-ecb", "-K", key.hex(),
+         "-in", str(src), "-out", str(dst)],
+        capture_output=True, timeout=300)
+    if proc.returncode != 0:
+        raise ApiError("business", "media encrypt failed")
+
+
+def _cdn_post_file(url: str, path: Path, size: int) -> tuple[int, dict, bytes]:
+    """Stream a file to the CDN in 64 KB blocks. Like _cdn_post_bytes: HTTP
+    errors are returned, transport errors raised as ApiError."""
+    with open(path, "rb") as f:
+        req = urllib.request.Request(
+            url, data=f, method="POST",
+            headers={"Content-Type": "application/octet-stream",
+                     "Content-Length": str(size)})
+        req.idempotent = True       # nothing is delivered before sendmessage
+        try:
+            with PROXY_POOL.open(req, timeout=CDN_UPLOAD_TIMEOUT_SEC) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except Exception:  # noqa: BLE001
+                body = b""
+            return e.code, dict(e.headers or {}), body
+        except (TimeoutError, urllib.error.URLError, ConnectionError,
+                http.client.HTTPException, OSError) as e:
+            raise ApiError("network",
+                           f"CDN upload error: {net_detail(e)}") from e
+
+FILE_SEND_MAX_BYTES = 25 * 1024 * 1024
+VIDEO_SEND_MAX_BYTES = 50 * 1024 * 1024
+VIDEO_RECV_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _upload_media_to_cdn(creds: dict, path: Path, to_user_id: str,
+                         media_type: int, max_bytes: int) -> dict:
+    """Shared CDN upload pipeline (getuploadurl -> AES-128-ECB encrypt
+    -> POST ciphertext). media_type: 1=image, 2=video, 3=file.
+    Streams end to end (md5, encryption and the upload are all chunked), so
+    a 50 MB video no longer sits in RAM as plaintext plus ciphertext.
+    Transport failures of the CDN POST are retried like upstream
+    cdn-upload.ts (3 attempts, 4xx aborts at once): the old loop retried
+    only HTTP 5xx, so one dropped connection failed the whole send.
+    Returns filekey, download_param, aeskey (hex string), file_size and
+    file_size_ciphertext. Keys and CDN parameters are never logged."""
+    if not path.is_file():
+        raise ApiError("business", f"file not found: {path}")
+    rawsize = path.stat().st_size
+    if not rawsize:
+        raise ApiError("business", "file is empty")
+    if rawsize > max_bytes:
+        raise ApiError("business", f"file exceeds {max_bytes} bytes")
+    rawfilemd5 = _md5_file(path)
+    filesize = _aes_ecb_padded_size(rawsize)
+    filekey = secrets.token_hex(16)
+    aeskey = secrets.token_bytes(16)
+    resp = bot_post_retry(creds, "ilink/bot/getuploadurl", {
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": to_user_id,
+        "rawsize": rawsize,
+        "rawfilemd5": rawfilemd5,
+        "filesize": filesize,
+        "no_need_thumb": True,
+        "aeskey": aeskey.hex(),
+    }, timeout=15)
+    upload_full_url = (resp.get("upload_full_url") or "").strip()
+    upload_param = resp.get("upload_param") or ""
+    if upload_full_url:
+        cdn_url = upload_full_url
+    elif upload_param:
+        # Fallback construction, mirroring the download URL pattern
+        # (<cdn>/download?encrypted_query_param=...); upload_full_url
+        # takes precedence whenever the server provides it.
+        cdn_url = (f"{CDN_BASE_URL}/upload?encrypted_query_param="
+                   f"{urllib.parse.quote(upload_param, safe='')}"
+                   f"&filekey={filekey}")
+    else:
+        raise ApiError("business",
+                       "getuploadurl returned no upload URL")
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    enc_path = OUTBOX_DIR / f".upload-{filekey}.enc"
+    try:
+        _encrypt_aes_ecb_file(path, aeskey, enc_path)
+        if enc_path.stat().st_size != filesize:
+            raise ApiError("business", "AES ciphertext size mismatch")
+        last_error = "CDN upload failed"
+        for attempt in range(CDN_UPLOAD_MAX_RETRIES):
+            if attempt:
+                time.sleep(CDN_RETRY_DELAYS_SEC[
+                    min(attempt - 1, len(CDN_RETRY_DELAYS_SEC) - 1)])
+            try:
+                status, headers, _body = _cdn_post_file(cdn_url, enc_path,
+                                                        filesize)
+            except ApiError as e:
+                last_error = f"CDN upload {e.kind}: {e}"
+                log(f"CDN upload attempt {attempt + 1}/{CDN_UPLOAD_MAX_RETRIES}"
+                    f" failed ({e.kind}); retrying")
+                continue
+            lowered = {str(k).lower(): v for k, v in headers.items()}
+            download_param = lowered.get("x-encrypted-param")
+            if status == 200 and download_param:
+                return {
+                    "filekey": filekey,
+                    "download_param": download_param,
+                    "aeskey_hex": aeskey.hex(),
+                    "file_size": rawsize,
+                    "file_size_ciphertext": filesize,
+                }
+            if 400 <= status < 500:
+                raise ApiError("business", f"CDN upload client error {status}")
+            last_error = f"CDN upload status {status} (no download param)"
+        raise ApiError("network", last_error)
+    finally:
+        enc_path.unlink(missing_ok=True)
+
+
+def upload_image_to_cdn(creds: dict, path: Path,
+                        to_user_id: str) -> dict:
+    """Upload a local image file (media_type=1, image extensions only)."""
+    if path.suffix.lower() not in IMAGE_SEND_EXTS:
+        raise ApiError("business",
+                       f"not an image file (expected one of "
+                       f"{sorted(IMAGE_SEND_EXTS)}): {path.suffix}")
+    return _upload_media_to_cdn(creds, path, to_user_id, media_type=1,
+                                max_bytes=IMAGE_SEND_MAX_BYTES)
+
+
+def upload_file_to_cdn(creds: dict, path: Path,
+                       to_user_id: str) -> dict:
+    """Upload a local file attachment (media_type=3, any file type)."""
+    return _upload_media_to_cdn(creds, path, to_user_id, media_type=3,
+                                max_bytes=FILE_SEND_MAX_BYTES)
+
+
+def upload_video_to_cdn(creds: dict, path: Path,
+                        to_user_id: str) -> dict:
+    """Upload a local video (media_type=2, UploadMediaType.VIDEO)."""
+    return _upload_media_to_cdn(creds, path, to_user_id, media_type=2,
+                                max_bytes=VIDEO_SEND_MAX_BYTES)
+
+
+def send_image(creds: dict, to_user_id: str, path: Path,
+               context_token: str | None,
+               caption: str | None = None) -> dict:
+    """Upload + send one image. Returns counts and ids only (no keys)."""
+    uploaded = upload_image_to_cdn(creds, path, to_user_id)
+    sent = 0
+    client_ids: list[str] = []
+    if caption:
+        resp = send_text(creds, to_user_id, caption, context_token)
+        client_ids.append(resp.get("_client_id") or "")
+        sent += 1
+    client_id = f"openclaw-weixin:{now_ms()}-{secrets.token_hex(4)}"
+    msg = {
+        "from_user_id": "",
+        "to_user_id": to_user_id,
+        "client_id": client_id,
+        "message_type": 2,
+        "message_state": 2,
+        "item_list": [{
+            "type": 2,
+            "image_item": {
+                "media": {
+                    "encrypt_query_param": uploaded["download_param"],
+                    "aes_key": base64.b64encode(
+                        uploaded["aeskey_hex"].encode("ascii")).decode(),
+                    "encrypt_type": 1,
+                },
+                "mid_size": uploaded["file_size_ciphertext"],
+            },
+        }],
+    }
+    if context_token:
+        msg["context_token"] = context_token
+    resp = bot_post(creds, "ilink/bot/sendmessage", {"msg": msg}, timeout=15)
+    ret = resp.get("ret")
+    if ret not in (None, 0):
+        raise ApiError("business",
+                       f"sendmessage ret={ret} errmsg={resp.get('errmsg')}")
+    client_ids.append(client_id)
+    sent += 1
+    log(f"send image to={mask(to_user_id)} bytes={uploaded['file_size']} "
+        f"parts={sent}")
+    return {
+        "ok": True,
+        "parts_sent": sent,
+        "client_ids": client_ids,
+        "server_message_id": resp.get("message_id"),
+        "file_size": uploaded["file_size"],
+        "file_size_ciphertext": uploaded["file_size_ciphertext"],
+    }
+
+
+def send_file(creds: dict, to_user_id: str, path: Path,
+              context_token: str | None,
+              caption: str | None = None) -> dict:
+    """Upload + send one file attachment (send.ts sendFileMessageWeixin:
+    type=4, file_item.media + file_name + len as a string). A caption,
+    if given, is sent first as its own text message."""
+    uploaded = upload_file_to_cdn(creds, path, to_user_id)
+    sent = 0
+    client_ids: list[str] = []
+    if caption:
+        resp = send_text(creds, to_user_id, caption, context_token)
+        client_ids.append(resp.get("_client_id") or "")
+        sent += 1
+    client_id = f"openclaw-weixin:{now_ms()}-{secrets.token_hex(4)}"
+    msg = {
+        "from_user_id": "",
+        "to_user_id": to_user_id,
+        "client_id": client_id,
+        "message_type": 2,
+        "message_state": 2,
+        "item_list": [{
+            "type": 4,
+            "file_item": {
+                "media": {
+                    "encrypt_query_param": uploaded["download_param"],
+                    "aes_key": base64.b64encode(
+                        uploaded["aeskey_hex"].encode("ascii")).decode(),
+                    "encrypt_type": 1,
+                },
+                "file_name": path.name,
+                "len": str(uploaded["file_size"]),
+            },
+        }],
+    }
+    if context_token:
+        msg["context_token"] = context_token
+    resp = bot_post(creds, "ilink/bot/sendmessage", {"msg": msg}, timeout=15)
+    ret = resp.get("ret")
+    if ret not in (None, 0):
+        raise ApiError("business",
+                       f"sendmessage ret={ret} errmsg={resp.get('errmsg')}")
+    client_ids.append(client_id)
+    sent += 1
+    log(f"send file to={mask(to_user_id)} name={path.name} "
+        f"bytes={uploaded['file_size']} parts={sent}")
+    return {
+        "ok": True,
+        "parts_sent": sent,
+        "client_ids": client_ids,
+        "server_message_id": resp.get("message_id"),
+        "file_name": path.name,
+        "file_size": uploaded["file_size"],
+        "file_size_ciphertext": uploaded["file_size_ciphertext"],
+    }
+
+
+def send_video(creds: dict, to_user_id: str, path: Path,
+               context_token: str | None,
+               caption: str | None = None) -> dict:
+    """Upload + send one video (send.ts sendVideoMessageWeixin:
+    type=5, video_item.media + video_size as the CIPHERTEXT size).
+    A caption, if given, is sent first as its own text message."""
+    uploaded = upload_video_to_cdn(creds, path, to_user_id)
+    sent = 0
+    client_ids: list[str] = []
+    if caption:
+        resp = send_text(creds, to_user_id, caption, context_token)
+        client_ids.append(resp.get("_client_id") or "")
+        sent += 1
+    client_id = f"openclaw-weixin:{now_ms()}-{secrets.token_hex(4)}"
+    msg = {
+        "from_user_id": "",
+        "to_user_id": to_user_id,
+        "client_id": client_id,
+        "message_type": 2,
+        "message_state": 2,
+        "item_list": [{
+            "type": 5,
+            "video_item": {
+                "media": {
+                    "encrypt_query_param": uploaded["download_param"],
+                    "aes_key": base64.b64encode(
+                        uploaded["aeskey_hex"].encode("ascii")).decode(),
+                    "encrypt_type": 1,
+                },
+                "video_size": uploaded["file_size_ciphertext"],
+            },
+        }],
+    }
+    if context_token:
+        msg["context_token"] = context_token
+    resp = bot_post(creds, "ilink/bot/sendmessage", {"msg": msg}, timeout=15)
+    ret = resp.get("ret")
+    if ret not in (None, 0):
+        raise ApiError("business",
+                       f"sendmessage ret={ret} errmsg={resp.get('errmsg')}")
+    client_ids.append(client_id)
+    sent += 1
+    log(f"send video to={mask(to_user_id)} name={path.name} "
+        f"bytes={uploaded['file_size']} parts={sent}")
+    return {
+        "ok": True,
+        "parts_sent": sent,
+        "client_ids": client_ids,
+        "server_message_id": resp.get("message_id"),
+        "file_name": path.name,
+        "file_size": uploaded["file_size"],
+        "file_size_ciphertext": uploaded["file_size_ciphertext"],
+    }
+
+
+def notify(creds: dict, start: bool) -> bool:
+    """Lifecycle presence signal. Returns True on success. The server
+    drives the 'temporarily unable to connect' title in the user's
+    WeChat from this + poll liveness, so a failed notifyStart must be
+    retried by the caller - a one-shot attempt that hits a network flap
+    otherwise leaves the bot showing offline indefinitely."""
+    try:
+        bot_post(creds, "ilink/bot/msg/notifystart" if start
+                 else "ilink/bot/msg/notifystop", {}, timeout=10)
+        return True
+    except ApiError as e:
+        log(f"notify{'Start' if start else 'Stop'} failed ({e.kind}) - non-fatal")
+        return False
+
+
+# --------------------------------------------------------------------------
+# QR login
+# --------------------------------------------------------------------------
+
+def make_qr_png(content: str) -> bool:
+    for p in (BASE_DIR / "vendor",):
+        if p.exists():
+            sys.path.insert(0, str(p))
+    try:
+        import qrcode  # type: ignore
+        img = qrcode.make(content)
+        img.save(QR_PNG)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"QR PNG generation unavailable: {e}")
+        QR_TXT.write_text(content + "\n", encoding="utf-8")
+        return False
+
+
+def cmd_login(args) -> int:
+    creds = load_creds()
+    if creds and not args.force:
+        print(json.dumps({"ok": False,
+                          "error": "credentials already exist; use --force to re-login"},
+                         ensure_ascii=False))
+        return 2
+    local_tokens = [creds["bot_token"]] if creds else []
+    # api.ts: QR POST carries AuthorizationType + X-WECHAT-UIN, no token,
+    # no base_info.
+    resp = http_post(FIXED_BASE_URL,
+                     f"ilink/bot/get_bot_qrcode?bot_type={BOT_TYPE}",
+                     {"local_token_list": local_tokens},
+                     post_headers(token=None), timeout=15)
+    qrcode_value = resp.get("qrcode")
+    img_content = resp.get("qrcode_img_content")
+    if not qrcode_value or not img_content:
+        print(json.dumps({"ok": False, "error": "server returned no qrcode"},
+                         ensure_ascii=False))
+        return 1
+    atomic_write_json(LOGIN_FILE, {
+        "qrcode": qrcode_value,
+        "qrcode_img_content": img_content,
+        "started_at": now_ms(),
+        "current_base_url": FIXED_BASE_URL,
+        "refresh_count": 0,
+    })
+    atomic_write_json(LOGIN_STATUS_FILE, {"status": "wait", "updated_at": now_ms()})
+    png = make_qr_png(img_content)
+    print(json.dumps({"ok": True, "qr_png": str(QR_PNG) if png else None,
+                      "qr_txt": None if png else str(QR_TXT),
+                      "expires_in_sec": 300}, ensure_ascii=False))
+    return 0
+
+
+def _save_credentials(status_resp: dict) -> dict:
+    old_token = (load_creds() or {}).get("bot_token")
+    creds = {
+        "bot_token": status_resp.get("bot_token"),
+        "ilink_bot_id": status_resp.get("ilink_bot_id"),
+        "baseurl": status_resp.get("baseurl") or DEFAULT_BASE_URL,
+        "ilink_user_id": status_resp.get("ilink_user_id"),
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    atomic_write_json(CREDS_FILE, creds, mode=0o600)
+    os.chmod(CREDS_FILE, 0o600)
+    if old_token != creds.get("bot_token"):
+        _reset_session_state("new login")
+    return creds
+
+
+def cmd_wait_login(args) -> int:
+    session = read_json(LOGIN_FILE)
+    if not session:
+        print(json.dumps({"ok": False, "error": "no active login; run login first"},
+                         ensure_ascii=False))
+        return 2
+    deadline = time.time() + args.timeout
+    current_base = session.get("current_base_url") or FIXED_BASE_URL
+    refresh_count = int(session.get("refresh_count") or 0)
+    verify_code = args.verify_code
+    while time.time() < deadline:
+        endpoint = ("ilink/bot/get_qrcode_status?qrcode="
+                    + urllib.parse.quote(session["qrcode"], safe=""))
+        if verify_code:
+            endpoint += "&verify_code=" + urllib.parse.quote(verify_code, safe="")
+        resp = http_get(current_base, endpoint, timeout=35)
+        status = resp.get("status", "wait")
+        atomic_write_json(LOGIN_STATUS_FILE,
+                          {"status": status, "updated_at": now_ms()})
+        if status == "wait":
+            time.sleep(1)
+            continue
+        if status == "scaned":
+            verify_code = None
+            time.sleep(1)
+            continue
+        if status == "scaned_but_redirect":
+            host = resp.get("redirect_host")
+            if host:
+                current_base = f"https://{host}"
+            time.sleep(1)
+            continue
+        if status == "need_verifycode":
+            if not args.verify_code:
+                print(json.dumps({"ok": False, "status": "need_verifycode",
+                                  "error": "phone shows a verify code; "
+                                           "rerun wait-login --verify-code <code>"},
+                                 ensure_ascii=False))
+                return 3
+            # wrong code loops back to need_verifycode with the same code;
+            # require a fresh code from the user instead of spinning
+            print(json.dumps({"ok": False, "status": "need_verifycode",
+                              "error": "verify code not accepted; ask user for a new code"},
+                             ensure_ascii=False))
+            return 3
+        if status in ("expired", "verify_code_blocked"):
+            refresh_count += 1
+            if refresh_count > 3:
+                print(json.dumps({"ok": False, "status": status,
+                                  "error": "QR refreshed 3 times; giving up"},
+                                 ensure_ascii=False))
+                return 1
+            log(f"login QR {status}; refreshing ({refresh_count}/3)")
+            sub = argparse.Namespace(force=True)
+            if cmd_login(sub) != 0:
+                return 1
+            session = read_json(LOGIN_FILE)
+            session["refresh_count"] = refresh_count
+            atomic_write_json(LOGIN_FILE, session)
+            current_base = FIXED_BASE_URL
+            verify_code = None
+            continue
+        if status == "binded_redirect":
+            creds = load_creds()
+            if creds:
+                print(json.dumps({"ok": True, "already_connected": True,
+                                  "ilink_bot_id": mask(creds.get("ilink_bot_id")),
+                                  "ilink_user_id": mask(creds.get("ilink_user_id"))},
+                                 ensure_ascii=False))
+                return 0
+            print(json.dumps({"ok": False, "status": status,
+                              "error": "bot already bound elsewhere; no local credentials"},
+                             ensure_ascii=False))
+            return 1
+        if status == "confirmed":
+            if not resp.get("ilink_bot_id"):
+                print(json.dumps({"ok": False,
+                                  "error": "confirmed but ilink_bot_id missing"},
+                                 ensure_ascii=False))
+                return 1
+            creds = _save_credentials(resp)
+            LOGIN_FILE.unlink(missing_ok=True)
+            atomic_write_json(LOGIN_STATUS_FILE,
+                              {"status": "confirmed", "updated_at": now_ms()})
+            print(json.dumps({"ok": True, "connected": True,
+                              "ilink_bot_id": mask(creds["ilink_bot_id"]),
+                              "ilink_user_id": mask(creds["ilink_user_id"]),
+                              "baseurl": creds["baseurl"]}, ensure_ascii=False))
+            return 0
+        time.sleep(1)
+    print(json.dumps({"ok": False, "error": "login timeout"}, ensure_ascii=False))
+    return 1
+
+
+# --------------------------------------------------------------------------
+# Task store
+# --------------------------------------------------------------------------
+
+def task_path(message_id: str) -> Path:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(message_id))
+    return INBOX_DIR / f"{safe}.json"
+
+
+def load_task(message_id: str) -> dict | None:
+    return read_json(task_path(message_id))
+
+
+def save_task(task: dict) -> None:
+    atomic_write_json(task_path(task["message_id"]), task, mode=0o600)
+
+
+CONTEXT_TOKENS_FILE = STATE_DIR / "context_tokens.json"
+
+
+def remember_context_token(user: str, token: str | None) -> None:
+    """Newest context_token per user (official plugin: contextTokenStore,
+    persisted per account; "must be echoed verbatim in every outbound
+    send"). Proactive sends - send-direct alerts, send-image --to-user -
+    now echo it; they used to send none."""
+    if not user or not token:
+        return
+    try:
+        data = read_json(CONTEXT_TOKENS_FILE, {}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data[user] = {"token": token, "at": now_ms()}
+        atomic_write_json(CONTEXT_TOKENS_FILE, data, fsync=False)
+    except OSError as e:
+        log(f"context token save failed: {type(e).__name__}")
+
+
+def latest_context_token(user: str | None) -> tuple:
+    """(token, age_ms) of the newest context_token seen from `user`, else
+    (None, None). Falls back to the newest stored task of that user."""
+    if not user:
+        return None, None
+    entry = (read_json(CONTEXT_TOKENS_FILE, {}) or {}).get(user) or {}
+    if isinstance(entry, dict) and entry.get("token"):
+        return entry["token"], max(0, now_ms() - int(entry.get("at") or 0))
+    for summ in reversed(scan_task_index()[-50:]):
+        if summ.get("from_user_id") != user:
+            continue
+        t = load_task(summ["message_id"]) or {}
+        if t.get("context_token"):
+            return t["context_token"], max(
+                0, now_ms() - int(t.get("received_at") or 0))
+    return None, None
+
+
+def _file_sig(path: Path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _reset_session_state(reason: str) -> None:
+    """A new login invalidates everything tied to the old session: the
+    get_updates_buf cursor, the -14 pause, the auth alert, context tokens and
+    any rate-limit deferral (epiral/weixin-bot and wechat-ilink both clear
+    cursor + context tokens on re-login). Before, a successful re-scan still
+    sat out the rest of a 1-hour -14 pause."""
+    with contextlib.suppress(OSError):
+        atomic_write_json(CURSOR_FILE, {"get_updates_buf": ""})
+    for p in (SESSION_FILE, STATE_DIR / "auth_alert.json",
+              CONTEXT_TOKENS_FILE, RATE_LIMIT_FILE):
+        with contextlib.suppress(OSError):
+            p.unlink(missing_ok=True)
+    log(f"session state reset ({reason}): cursor, -14 pause, auth alert, "
+        "context tokens")
+
+
+def list_tasks() -> list[dict]:
+    tasks = []
+    for p in sorted(INBOX_DIR.glob("*.json")):
+        t = read_json(p)
+        if t and t.get("message_id"):
+            tasks.append(t)
+    return tasks
+
+
+# Cheap task listing for the hot paths (sender loop runs every second,
+# claim/status on demand). list_tasks() above opens and parses every inbox
+# file; with a month of history that was two full parses per second,
+# forever. This index only re-parses files whose (inode, mtime, size)
+# changed, and when the directory itself has been quiet for 2s it skips
+# even the per-file stat. Entries hold only the fields callers need.
+SCAN_REVALIDATE_SEC = 300       # periodic full re-parse as a safety net
+_SCAN_CACHE: dict[str, tuple] = {}
+_scan_state: dict = {"dir_mtime": None, "out": [], "full_at": 0.0}
+_scan_lock = threading.Lock()
+_SEND_KEYS = ("attempts", "no_auto_retry", "next_retry_at", "started_at",
+              "max_attempts")
+
+
+def _task_summary(t: dict) -> dict:
+    send = t.get("send") or {}
+    return {
+        "message_id": t["message_id"],
+        "status": t.get("status"),
+        "kind": t.get("kind"),
+        "from_user_id": t.get("from_user_id"),
+        "received_at": t.get("received_at") or 0,
+        "claimed_at": (t.get("execution") or {}).get("claimed_at"),
+        "send": {k: send[k] for k in _SEND_KEYS if k in send},
+    }
+
+
+def scan_task_index() -> list[dict]:
+    """Summaries of all tasks, oldest first. Callers must not mutate them
+    and must reload the real task (under task_lock) before acting."""
+    with _scan_lock:
+        try:
+            dst = os.stat(INBOX_DIR)
+        except OSError:
+            _SCAN_CACHE.clear()
+            _scan_state.update(dir_mtime=None, out=[])
+            return []
+        now_m = time.monotonic()
+        revalidate = now_m - _scan_state["full_at"] > SCAN_REVALIDATE_SEC
+        settled = time.time_ns() - dst.st_mtime_ns > 2_000_000_000
+        if (not revalidate and settled
+                and dst.st_mtime_ns == _scan_state["dir_mtime"]):
+            return list(_scan_state["out"])
+        out, seen = [], set()
+        try:
+            it = os.scandir(INBOX_DIR)
+        except OSError:
+            return list(_scan_state["out"])
+        with it:
+            for e in it:
+                name = e.name
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue
+                seen.add(name)
+                sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+                hit = _SCAN_CACHE.get(name)
+                if hit and hit[0] == sig and not revalidate:
+                    summ = hit[1]
+                else:
+                    t = read_json(INBOX_DIR / name)
+                    summ = (_task_summary(t)
+                            if isinstance(t, dict) and t.get("message_id")
+                            else None)
+                    _SCAN_CACHE[name] = (sig, summ)
+                if summ:
+                    out.append(summ)
+        for name in [n for n in _SCAN_CACHE if n not in seen]:
+            del _SCAN_CACHE[name]
+        out.sort(key=lambda x: (x["received_at"], str(x["message_id"])))
+        _scan_state.update(dir_mtime=dst.st_mtime_ns, out=out)
+        if revalidate:
+            _scan_state["full_at"] = now_m
+        return list(out)
+
+
+HB_LOCK_FILE = STATE_DIR / "heartbeat.lock"
+
+
+def update_heartbeat(**fields) -> None:
+    """Merge fields into heartbeat.json. Serialized with flock (receiver
+    thread, sender thread and CLI processes all write it, and the plain
+    read-modify-write used to lose updates) and never raises: telemetry
+    must not be able to take the poll loop down. No fsync: it is rewritten
+    constantly and a lost beat after power loss is harmless."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(HB_LOCK_FILE, "a+") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                hb = read_json(HEARTBEAT_FILE, {}) or {}
+                hb.update(fields)
+                atomic_write_json(HEARTBEAT_FILE, hb, fsync=False)
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
+    except OSError as e:
+        log(f"heartbeat write failed: {type(e).__name__}")
+
+
+# --------------------------------------------------------------------------
+# Inbound media (official CDN flow: src/cdn/pic-decrypt.ts, media-download.ts)
+# --------------------------------------------------------------------------
+
+CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+MEDIA_MAX_BYTES = 25 * 1024 * 1024
+MEDIA_TIMEOUT_SEC = 45
+
+
+def _parse_aes_key(image_item: dict) -> bytes | None:
+    """AES-128 key for an inbound image: image_item.aeskey (hex) is
+    preferred; otherwise media.aes_key is base64 of 16 raw bytes, or
+    base64 of a 32-char hex string (pic-decrypt.ts parseAesKey)."""
+    aeskey_hex = image_item.get("aeskey")
+    if aeskey_hex:
+        try:
+            key = bytes.fromhex(aeskey_hex)
+            if len(key) == 16:
+                return key
+        except ValueError:
+            pass
+    aes_key_b64 = ((image_item.get("media") or {}).get("aes_key")) or ""
+    if aes_key_b64:
+        # Some payloads carry the hex key string directly, unwrapped.
+        if len(aes_key_b64) == 32 and all(
+                c in "0123456789abcdefABCDEF" for c in aes_key_b64):
+            return bytes.fromhex(aes_key_b64)
+        try:
+            decoded = base64.b64decode(aes_key_b64)
+        except Exception:
+            return None
+        if len(decoded) == 16:
+            return decoded
+        if len(decoded) == 32:
+            try:
+                return bytes.fromhex(decoded.decode("ascii"))
+            except Exception:
+                return None
+    return None
+
+
+def _fetch_bytes(url: str, timeout: int = MEDIA_TIMEOUT_SEC,
+                 max_bytes: int = MEDIA_MAX_BYTES) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Muse/1.0"})
+    with PROXY_POOL.open(req, timeout=timeout) as resp:
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ApiError("business", "media exceeds size cap")
+    return data
+
+
+def _fetch_to_file(url: str, dst: Path, timeout: int,
+                   max_bytes: int) -> int:
+    """Stream a download to disk in 1MB chunks (constant memory -
+    videos can be far too large for this VM to hold in RAM)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Muse/1.0"})
+    total = 0
+    with PROXY_POOL.open(req, timeout=timeout) as resp, \
+            open(dst, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ApiError("business", "media exceeds size cap")
+            f.write(chunk)
+    return total
+
+
+def _decrypt_aes_ecb_file(src: Path, key: bytes, dst: Path) -> None:
+    """File-to-file AES-128-ECB decrypt via openssl (streaming, so a
+    100MB video never sits in RAM three times over)."""
+    proc = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-128-ecb", "-K", key.hex(),
+         "-in", str(src), "-out", str(dst)],
+        capture_output=True, timeout=180)
+    if proc.returncode != 0:
+        raise ApiError("business", "media decrypt failed")
+
+
+def _md5_file(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _decrypt_aes_ecb(data: bytes, key: bytes) -> bytes:
+    """AES-128-ECB with PKCS7 unpadding via the openssl CLI (stdlib has
+    no AES). Raises ApiError on failure."""
+    proc = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-128-ecb", "-K", key.hex()],
+        input=data, capture_output=True, timeout=30)
+    if proc.returncode != 0:
+        raise ApiError("business", "media decrypt failed")
+    return proc.stdout
+
+
+def _sniff_image_ext(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[4:8] == b"ftyp":
+        return ".heic"
+    return ".bin"
+
+
+def download_image(image_item: dict, mid: str) -> dict:
+    """Download (and decrypt) an inbound image to MEDIA_DIR.
+    Returns {"media_path", "media_bytes"}; raises ApiError on failure."""
+    media = image_item.get("media") or {}
+    url = media.get("full_url")
+    if not url:
+        eqp = media.get("encrypt_query_param")
+        if not eqp:
+            raise ApiError("business", "image item has no CDN reference")
+        url = (f"{CDN_BASE_URL}/download?encrypted_query_param="
+               f"{urllib.parse.quote(eqp, safe='')}")
+    raw = _fetch_bytes(url)
+    key = _parse_aes_key(image_item)
+    data = _decrypt_aes_ecb(raw, key) if key else raw
+    if not data:
+        raise ApiError("business", "image decrypt produced no data")
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    path = MEDIA_DIR / f"{mid}{_sniff_image_ext(data)}"
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+    return {"media_path": str(path), "media_bytes": len(data)}
+
+
+def _sanitize_filename(name: str) -> str:
+    base = (name or "").replace("\\", "/").split("/")[-1].strip()
+    base = "".join(c for c in base
+                   if c not in '<>:"|?*' and ord(c) >= 32).strip()
+    return base[:120] or "file.bin"
+
+
+def download_file(file_item: dict, mid: str) -> dict:
+    """Download (and decrypt) an inbound file attachment to FILES_DIR.
+    Mirrors the FILE branch of media-download.ts: media.aes_key is
+    required and the payload is always AES-128-ECB encrypted.
+    Returns {"media_path", "media_bytes", "file_name"}."""
+    media = file_item.get("media") or {}
+    url = media.get("full_url")
+    if not url:
+        eqp = media.get("encrypt_query_param")
+        if not eqp:
+            raise ApiError("business", "file item has no CDN reference")
+        url = (f"{CDN_BASE_URL}/download?encrypted_query_param="
+               f"{urllib.parse.quote(eqp, safe='')}")
+    key = _parse_aes_key(file_item)
+    if key is None:
+        raise ApiError("business", "file item has no usable aes_key")
+    raw = _fetch_bytes(url)
+    data = _decrypt_aes_ecb(raw, key)
+    if not data:
+        raise ApiError("business", "file decrypt produced no data")
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    fname = _sanitize_filename(file_item.get("file_name") or "")
+    path = FILES_DIR / f"{mid}__{fname}"
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+    return {"media_path": str(path), "media_bytes": len(data),
+            "file_name": fname}
+
+
+def download_video(video_item: dict, mid: str) -> dict:
+    """Download (and decrypt) an inbound video to MEDIA_DIR.
+    Mirrors download_file (media.aes_key required, payload always
+    AES-128-ECB encrypted), plus two video extras: the item carries a
+    plaintext video_md5 we verify after decryption, and an encrypted
+    thumb_media poster frame (same key) saved alongside best-effort.
+    Returns {"media_path", "media_bytes", "play_length", ...}."""
+    media = video_item.get("media") or {}
+    url = media.get("full_url")
+    if not url:
+        eqp = media.get("encrypt_query_param")
+        if not eqp:
+            raise ApiError("business", "video item has no CDN reference")
+        url = (f"{CDN_BASE_URL}/download?encrypted_query_param="
+               f"{urllib.parse.quote(eqp, safe='')}")
+    key = _parse_aes_key(video_item)
+    if key is None:
+        raise ApiError("business", "video item has no usable aes_key")
+    # Streamed end to end (disk -> openssl file-to-file -> streamed
+    # md5): a 100MB video must never be held in RAM on this small VM.
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = MEDIA_DIR / f".{mid}.part"
+    plain_path = MEDIA_DIR / f"{mid}.plain"
+    try:
+        _fetch_to_file(url, tmp_path, timeout=120,
+                       max_bytes=VIDEO_RECV_MAX_BYTES)
+        _decrypt_aes_ecb_file(tmp_path, key, plain_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    size = plain_path.stat().st_size if plain_path.exists() else 0
+    if not size:
+        plain_path.unlink(missing_ok=True)
+        raise ApiError("business", "video decrypt produced no data")
+    md5_expect = (video_item.get("video_md5") or "").lower()
+    md5_ok = None
+    if md5_expect:
+        md5_ok = _md5_file(plain_path) == md5_expect
+        if not md5_ok:
+            plain_path.unlink(missing_ok=True)
+            raise ApiError("business",
+                           "video md5 mismatch after decrypt")
+    with open(plain_path, "rb") as f:
+        head = f.read(16)
+    ext = ".mp4" if head[4:8] == b"ftyp" else ".bin"
+    path = MEDIA_DIR / f"{mid}{ext}"
+    os.replace(plain_path, path)
+    os.chmod(path, 0o600)
+    out = {"media_path": str(path), "media_bytes": size,
+           "play_length": video_item.get("play_length"),
+           "video_md5_ok": md5_ok}
+    thumb = video_item.get("thumb_media") or {}
+    if thumb.get("encrypt_query_param") or thumb.get("full_url"):
+        try:
+            turl = thumb.get("full_url") or (
+                f"{CDN_BASE_URL}/download?encrypted_query_param="
+                f"{urllib.parse.quote(thumb.get('encrypt_query_param') or '', safe='')}")
+            traw = _fetch_bytes(turl)
+            tdata = _decrypt_aes_ecb(traw, key)
+            if tdata:
+                tpath = MEDIA_DIR / f"{mid}_thumb.jpg"
+                tpath.write_bytes(tdata)
+                os.chmod(tpath, 0o600)
+                out["thumb_path"] = str(tpath)
+        except Exception as e:  # noqa: BLE001 - poster is best-effort
+            log(f"video thumb download failed id={mid}: {e}")
+    return out
+
+
+def _split_media_items(items: list) -> tuple:
+    image_item = next(((it.get("image_item") or {}) for it in items
+                       if it.get("type") == 2), None)
+    file_item = next(((it.get("file_item") or {}) for it in items
+                      if it.get("type") == 4), None)
+    video_item = next(((it.get("video_item") or {}) for it in items
+                       if it.get("type") == 5), None)
+    return image_item, file_item, video_item
+
+
+VOICE_TEXT_PREFIX = "[语音转文字] "
+_MEDIA_LABELS = {2: "[图片]", 3: "[语音]", 4: "[文件]", 5: "[视频]"}
+MEDIA_DOWNLOAD_ATTEMPTS = 3
+MEDIA_RETRY_DELAYS_SEC = (2, 5)
+
+
+def _item_text(it: dict) -> str:
+    """Text of a text item, or WeChat's own transcription of a voice item
+    (voice_item.text, used as the body by inbound.ts bodyFromItemList)."""
+    t = it.get("type")
+    if t == 1:
+        return str((it.get("text_item") or {}).get("text") or "")
+    if t == 3:
+        return str((it.get("voice_item") or {}).get("text") or "")
+    return ""
+
+
+def _quote_text(items: list) -> str | None:
+    """'title | body' of a quoted message (inbound.ts inlineQuoteBody)."""
+    for it in items:
+        ref = it.get("ref_msg")
+        if not isinstance(ref, dict):
+            continue
+        parts = []
+        title = str(ref.get("title") or "").strip()
+        if title:
+            parts.append(title)
+        quoted = ref.get("message_item") or {}
+        body = _item_text(quoted) or _MEDIA_LABELS.get(quoted.get("type"), "")
+        if body and body != title:
+            parts.append(body)
+        if parts:
+            return " | ".join(parts)[:2000]
+    return None
+
+
+def _transient_net_error(e: BaseException) -> bool:
+    if isinstance(e, ApiError):
+        return e.kind in ("connect", "network", "timeout")
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500
+    return isinstance(e, (urllib.error.URLError, TimeoutError,
+                          ConnectionError, http.client.HTTPException))
+
+
+def ingest_message(creds: dict, m: dict) -> None:
+    """Validate and persist one inbound message. Never blocks on media:
+    images/files/videos are stored as a `downloading` task and fetched by
+    the media workers, so a slow 100MB video can no longer stall the long
+    poll (which made the hook think serve was dead and restart it
+    mid-download). The task exists on disk before the cursor is persisted,
+    and `downloading` tasks are resumed after a restart.
+    Voice notes carrying WeChat's speech-to-text become ordinary text tasks
+    (they used to get the canned "unsupported" reply); a quoted message is
+    kept as `quote`; the newest context_token per user is remembered."""
+    items = m.get("item_list") or []
+    # inbound.ts getWeixinMessageId: top-level id, else the first item msg_id
+    mid = str(m.get("message_id") or "") or next(
+        (str(it["msg_id"]) for it in items if it.get("msg_id")), "")
+    if not mid:
+        log("inbound message without message_id; skipped")
+        return
+    allowed_user = creds.get("ilink_user_id")
+    sender = m.get("from_user_id") or ""
+    if m.get("group_id"):
+        log(f"ignored group message id={mid}")
+        return
+    if m.get("message_type") != 1:
+        log(f"ignored non-user message id={mid} type={m.get('message_type')}")
+        return
+    if not allowed_user or sender != allowed_user:
+        log(f"ignored unauthorized sender id={mid} sender={mask(sender)}")
+        return
+    types = [it.get("type") for it in items]
+    texts = [_item_text(it) for it in items if it.get("type") in (1, 3)]
+    transcribed = any(it.get("type") == 3 and _item_text(it) for it in items)
+    mute_voice = any(it.get("type") == 3 and not _item_text(it)
+                     for it in items)
+    image_item, file_item, video_item = _split_media_items(items)
+    has_media = (image_item is not None or file_item is not None
+                 or video_item is not None)
+    text = "".join(texts)
+    if has_media:
+        kind = ("image" if image_item is not None
+                else "file" if file_item is not None else "video")
+        status, result_text = "downloading", None
+    elif types and all(t in (1, 3) for t in types) and not mute_voice:
+        kind, status, result_text = "text", "pending_execution", None
+        if transcribed:
+            text = VOICE_TEXT_PREFIX + text
+    else:
+        kind, status, result_text = ("unsupported", "waiting_send",
+                                     UNSUPPORTED_TEXT)
+    quote = _quote_text(items)
+    task = {
+        "message_id": mid,
+        "from_user_id": sender,
+        "to_user_id": m.get("to_user_id"),
+        "session_id": m.get("session_id"),
+        "context_token": m.get("context_token"),
+        "create_time_ms": m.get("create_time_ms"),
+        "received_at": now_ms(),
+        "item_types": types,
+        "kind": kind,
+        "text": text,
+        "quote": quote,
+        "voice_transcribed": bool(transcribed),
+        "media_path": None,
+        "media_bytes": None,
+        "file_name": None,
+        "play_length": None,
+        "thumb_path": None,
+        "media_error": None,
+        "raw_items": items,
+        "status": status,
+        "result_text": result_text,
+        "execution": None,
+        "send": None,
+    }
+    with task_lock():
+        # Duplicate check happens BEFORE any download: a redelivered
+        # message (cursor reset, restart) used to re-download a whole video
+        # before being discarded.
+        if load_task(mid):
+            log(f"duplicate message id={mid}; skipped")
+            return
+        save_task(task)
+        remember_context_token(sender, m.get("context_token"))
+    clear_rate_limit()   # a user message lifts the iLink send limit
+    update_heartbeat(last_inbound_at=now_ms())
+    log(f"task stored id={mid} kind={kind} chars={len(task['text'])}"
+        + (" voice=transcribed" if transcribed else "")
+        + (" quote=yes" if quote else ""))
+    if status == "downloading":
+        enqueue_media(mid)
+
+
+MEDIA_WORKERS = 2
+_media_q: "queue.Queue[str]" = queue.Queue()
+_media_queued: set = set()
+_media_queued_lock = threading.Lock()
+
+
+def enqueue_media(mid: str) -> None:
+    with _media_queued_lock:
+        if mid in _media_queued:
+            return
+        _media_queued.add(mid)
+    _media_q.put(mid)
+
+
+def process_media_task(mid: str) -> None:
+    """Download+decrypt the media of a `downloading` task, then flip it to
+    pending_execution (media_error recorded on failure, exactly like the
+    old synchronous path)."""
+    task = load_task(mid)
+    if not task or task.get("status") != "downloading":
+        return
+    kind = task.get("kind")
+    image_item, file_item, video_item = _split_media_items(
+        task.get("raw_items") or [])
+    src_item = {"image": image_item, "file": file_item,
+                "video": video_item}.get(kind)
+    media_info: dict = {}
+    media_error = None
+    try:
+        if src_item is None:
+            raise ApiError("business", "media item missing from stored message")
+        fetch = {"image": download_image, "file": download_file,
+                 "video": download_video}[kind]
+        for attempt in range(MEDIA_DOWNLOAD_ATTEMPTS):
+            try:
+                media_info = fetch(src_item, mid)
+                break
+            except Exception as e:  # noqa: BLE001 - classified below
+                # A dropped CDN connection used to fail the task at once
+                # ("please resend"); the GET is idempotent, so retry it.
+                if (attempt == MEDIA_DOWNLOAD_ATTEMPTS - 1
+                        or not _transient_net_error(e) or _stop.is_set()):
+                    raise
+                log(f"{kind} download attempt {attempt + 1} failed id={mid} "
+                    f"({net_detail(e)}); retrying")
+                _stop.wait(MEDIA_RETRY_DELAYS_SEC[attempt])
+        log(f"{kind} downloaded id={mid} bytes={media_info.get('media_bytes')}")
+    except Exception as e:  # noqa: BLE001 - worker reports it honestly
+        media_error = f"{type(e).__name__}: {e}"[:200]
+        media_fields = sorted(((src_item or {}).get("media") or {}).keys())
+        log(f"{kind} download failed id={mid}: {media_error} "
+            f"item_fields={sorted((src_item or {}).keys())} "
+            f"media_fields={media_fields}")
+    with task_lock():
+        fresh = load_task(mid)
+        if not fresh or fresh.get("status") != "downloading":
+            return
+        fresh.update({
+            "media_path": media_info.get("media_path"),
+            "media_bytes": media_info.get("media_bytes"),
+            "file_name": media_info.get("file_name"),
+            "play_length": media_info.get("play_length"),
+            "thumb_path": media_info.get("thumb_path"),
+            "media_error": media_error,
+            "status": "pending_execution",
+        })
+        save_task(fresh)
+    log(f"media task ready id={mid} kind={kind} ok={media_error is None}")
+
+
+def media_worker_loop() -> None:
+    while not _stop.is_set():
+        try:
+            mid = _media_q.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            process_media_task(mid)
+        except Exception as e:  # noqa: BLE001 - a worker must never die
+            log(f"media worker error id={mid}: {type(e).__name__}")
+        finally:
+            with _media_queued_lock:
+                _media_queued.discard(mid)
+
+
+def recover_downloading() -> None:
+    """After a restart, resume tasks that were still downloading."""
+    n = 0
+    for t in scan_task_index():
+        if t.get("status") != "downloading":
+            continue
+        mid = str(t["message_id"])
+        for leftover in (MEDIA_DIR / f".{mid}.part", MEDIA_DIR / f"{mid}.plain"):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
+        enqueue_media(mid)
+        n += 1
+    if n:
+        log(f"resuming {n} interrupted media download(s)")
+
+
+# --------------------------------------------------------------------------
+# Sending (single flight per task; timeout => uncertain, never blind retry)
+# --------------------------------------------------------------------------
+
+SEND_CHUNK_LIMIT = 4000          # official plugin outbound textChunkLimit
+SEND_CHUNK_SAFE = 1800           # the old limit: fallback if a long part is rejected
+SEND_TUNING_FILE = STATE_DIR / "send_tuning.json"
+SEND_TUNING_TTL_MS = 24 * 3600 * 1000
+SEND_MAX_ATTEMPTS = 3
+SEND_RETRY_DELAYS_MS = (60_000, 180_000)
+# Failing before the request left this host is a guaranteed non-delivery
+# (and the common failure on this flaky egress): retry sooner and more often.
+SEND_MAX_ATTEMPTS_CONNECT = 6
+SEND_CONNECT_RETRY_DELAYS_MS = (10_000, 30_000, 60_000, 120_000, 300_000)
+# iLink ret/errcode -2: bot-wide rate limit (wechat-ilink: retry after 90 s,
+# lifted early when the user sends a message). ilink-hub also saw -2
+# "prepare failed" for media sent without iLink-App-* headers (we send them).
+RATE_LIMIT_ERRCODE = -2
+RATE_LIMIT_FILE = STATE_DIR / "ratelimit.json"
+RATE_LIMIT_RETRY_MS = 90_000
+RATE_LIMIT_POLL_RETRY_SEC = 30
+
+
+def split_spans(text: str, limit: int = SEND_CHUNK_LIMIT) -> list[tuple[int, int]]:
+    """(start, end) spans of `text` to send in order: paragraphs packed up
+    to `limit` characters, over-long paragraphs hard-cut, newlines at span
+    edges dropped - the same parts the old split_text produced, but as
+    offsets, so a resend can continue after the last confirmed part."""
+    n = len(text)
+    if n <= limit:
+        return [(0, n)]
+    spans: list[tuple[int, int]] = []
+    cur = None
+    pos = 0
+    while True:
+        nl = text.find("\n", pos)
+        pend = n if nl < 0 else nl
+        if pend - pos <= limit:
+            pieces = [(pos, pend)]
+        else:
+            pieces = [(i, min(i + limit, pend)) for i in range(pos, pend, limit)]
+        for ps, pe in pieces:
+            if cur is None:
+                cur = (ps, pe)
+            elif pe - cur[0] <= limit:
+                cur = (cur[0], pe)
+            else:
+                spans.append(cur)
+                cur = (ps, pe)
+        if nl < 0:
+            break
+        pos = nl + 1
+    if cur is not None:
+        spans.append(cur)
+    out = []
+    for s, e in spans:
+        while s < e and text[s] == "\n":
+            s += 1
+        while e > s and text[e - 1] == "\n":
+            e -= 1
+        if text[s:e].strip():
+            out.append((s, e))
+    return out or [(0, n)]
+
+
+def split_text(text: str, limit: int = SEND_CHUNK_LIMIT) -> list[str]:
+    """Split long replies into sequential chunks at natural boundaries."""
+    return [text[s:e] for s, e in split_spans(text, limit)]
+
+
+def _resume_offset(text: str, done_upto: int) -> int:
+    i = max(0, min(int(done_upto or 0), len(text)))
+    while 0 < i < len(text) and text[i] == "\n":
+        i += 1
+    return i
+
+
+def _spans_from(text: str, start: int, limit: int) -> list[tuple[int, int]]:
+    if start >= len(text):
+        return [] if start else [(0, 0)]
+    return [(s + start, e + start) for s, e in split_spans(text[start:], limit)]
+
+
+def _chunk_limit() -> int:
+    t = read_json(SEND_TUNING_FILE, {}) or {}
+    lim = t.get("chunk_limit")
+    if isinstance(lim, int) and now_ms() - int(t.get("at") or 0) < SEND_TUNING_TTL_MS:
+        return max(200, min(lim, SEND_CHUNK_LIMIT))
+    return SEND_CHUNK_LIMIT
+
+
+def _downgrade_chunk_limit() -> None:
+    with contextlib.suppress(OSError):
+        atomic_write_json(SEND_TUNING_FILE,
+                          {"chunk_limit": SEND_CHUNK_SAFE, "at": now_ms()},
+                          fsync=False)
+
+
+def rate_limited_until() -> int:
+    until = int((read_json(RATE_LIMIT_FILE, {}) or {}).get("until_ms") or 0)
+    return until if until > now_ms() else 0
+
+
+def note_rate_limit() -> int:
+    until = now_ms() + RATE_LIMIT_RETRY_MS
+    with contextlib.suppress(OSError):
+        atomic_write_json(RATE_LIMIT_FILE, {"until_ms": until, "at": now_ms()},
+                          fsync=False)
+    log(f"iLink rate limit (-2): deferring sends for "
+        f"{RATE_LIMIT_RETRY_MS // 1000}s")
+    return until
+
+
+def clear_rate_limit() -> None:
+    if RATE_LIMIT_FILE.exists():
+        with contextlib.suppress(OSError):
+            RATE_LIMIT_FILE.unlink()
+
+
+def _record_send_progress(task_id: str, started_at: int, **fields) -> None:
+    """Persist per-part progress of an in-flight send. No fsync: losing it
+    only means a later resend repeats one part."""
+    try:
+        with task_lock():
+            t = load_task(task_id)
+            if not t or t.get("status") != "sending":
+                return
+            send = t.get("send") or {}
+            if send.get("started_at") != started_at:
+                return
+            for k, v in fields.items():
+                if v is None:
+                    send.pop(k, None)
+                else:
+                    send[k] = v
+            t["send"] = send
+            atomic_write_json(task_path(task_id), t, mode=0o600, fsync=False)
+    except OSError as e:
+        log(f"send progress save failed: {type(e).__name__}")
+
+
+def attempt_send(task_id: str, allow_retry: bool = False,
+                 force: bool = False) -> dict:
+    """Send a task's reply part by part, recording progress (`done_upto` =
+    end offset of the last confirmed part, `pending` = the part in flight
+    and its client_id), so a retry or a human-approved resend continues
+    where delivery stopped instead of re-sending earlier parts.
+      connect / business / http failure -> that part was NOT delivered:
+          send_failed with automatic retries (connect: sooner and more
+          often; -2: not before the rate-limit deferral ends). Out of
+          retries -> send_uncertain(exhausted), so the hook alerts a human.
+      network / timeout -> the part may have been delivered:
+          send_uncertain, never retried automatically."""
+    creds = load_creds()
+    if not creds:
+        return {"ok": False, "error": "no credentials"}
+    with task_lock():
+        task = load_task(task_id)
+        if not task:
+            return {"ok": False, "error": "task not found"}
+        status = task["status"]
+        prev = dict(task.get("send") or {})
+        if status == "sent":
+            return {"ok": True, "already_sent": True}
+        retrying = (allow_retry and status == "send_failed"
+                    and not prev.get("no_auto_retry")
+                    and int(prev.get("attempts", 1))
+                    < int(prev.get("max_attempts") or SEND_MAX_ATTEMPTS))
+        # A human-approved resend (`bridge.py send`) may resume
+        # send_uncertain / exhausted tasks; the old code refused them, so the
+        # resend documented in EXECUTOR.md could never work.
+        forced = force and status in ("send_failed", "send_uncertain")
+        if status != "waiting_send" and not retrying and not forced:
+            return {"ok": False, "error": f"task status is {status}"}
+        fresh = status == "waiting_send"
+        prev_attempts = 0 if fresh else int(prev.get("attempts", 0))
+        done_upto = 0 if fresh else int(prev.get("done_upto") or 0)
+        pending = {} if fresh else dict(prev.get("pending") or {})
+        started_at = now_ms()
+        task["status"] = "sending"
+        task["send"] = {"started_at": started_at, "attempts": prev_attempts,
+                        "done_upto": done_upto}
+        if pending:
+            task["send"]["pending"] = pending
+        save_task(task)
+        text = task.get("result_text") or ""
+        to_user = task["from_user_id"]
+        ctx = task.get("context_token")
+    queue_spans = _spans_from(text, _resume_offset(text, done_upto),
+                              _chunk_limit())
+    parts_sent = 0
+    last_resp: dict = {}
+    failure: ApiError | None = None
+    downgraded = False
+    while queue_spans:
+        s, e = queue_spans[0]
+        same = (pending.get("start"), pending.get("end")) == (s, e)
+        pending = {"start": s, "end": e,
+                   "client_id": (pending.get("client_id") if same else None)
+                   or new_client_id()}
+        _record_send_progress(task_id, started_at, pending=pending)
+        try:
+            last_resp = send_text(creds, to_user, text[s:e], ctx,
+                                  client_id=pending["client_id"])
+        except ApiError as exc:
+            if (exc.kind == "business" and exc.code != RATE_LIMIT_ERRCODE
+                    and e - s > SEND_CHUNK_SAFE and not downgraded):
+                # Parts above the old 1800 limit are what the official plugin
+                # sends; should this server reject one, re-split and keep the
+                # smaller limit for 24 h.
+                downgraded = True
+                _downgrade_chunk_limit()
+                log(f"send task={task_id}: {e - s}-char part rejected "
+                    f"({_scrub(exc)}); re-splitting at {SEND_CHUNK_SAFE}")
+                queue_spans = _spans_from(text, s, SEND_CHUNK_SAFE)
+                pending = {}
+                continue
+            failure = exc
+            break
+        queue_spans.pop(0)
+        parts_sent += 1
+        done_upto = e
+        pending = {}
+        _record_send_progress(task_id, started_at, done_upto=done_upto,
+                              pending=None)
+    attempts = prev_attempts + 1
+    parts = parts_sent + len(queue_spans)
+    if failure is None:
+        outcome = {"ok": True, "client_id": last_resp.get("_client_id"),
+                   "server_message_id": last_resp.get("message_id"),
+                   "parts": parts_sent, "attempts": attempts}
+        final_status = "sent"
+    elif failure.kind in ("timeout", "network"):
+        # Result unknown: a timeout or a connection dropped mid-response
+        # means the server may already have accepted the part (observed
+        # 2026-10-27: two "network-failed" attempts both delivered, the
+        # reply arrived 3 times). Never auto-retry; surface as uncertain.
+        outcome = {"ok": False, "uncertain": True, "attempts": attempts,
+                   "parts_sent": parts_sent, "parts": parts,
+                   "no_auto_retry": True,
+                   "error": f"send {failure.kind}; result unknown, not retried"}
+        final_status = "send_uncertain"
+    else:
+        connect = failure.kind == "connect"
+        max_attempts = (SEND_MAX_ATTEMPTS_CONNECT if connect
+                        else SEND_MAX_ATTEMPTS)
+        outcome = {"ok": False, "error": f"{failure.kind}: {_scrub(failure)}",
+                   "attempts": attempts, "parts_sent": parts_sent,
+                   "parts": parts, "max_attempts": max_attempts,
+                   "not_delivered": True}
+        if attempts < max_attempts:
+            delays = (SEND_CONNECT_RETRY_DELAYS_MS if connect
+                      else SEND_RETRY_DELAYS_MS)
+            delay = delays[min(attempts - 1, len(delays) - 1)]
+            if failure.code == RATE_LIMIT_ERRCODE:
+                delay = max(delay, note_rate_limit() - now_ms())
+            outcome["next_retry_at"] = now_ms() + delay
+            final_status = "send_failed"
+        else:
+            # Out of retries and definitely NOT delivered: surface it like an
+            # uncertain send (the hook alerts once and a human decides)
+            # instead of parking a lost reply silently in send_failed.
+            outcome.update(no_auto_retry=True, exhausted=True)
+            outcome["error"] += (f"; all {attempts} attempts failed, "
+                                 "not delivered")
+            final_status = "send_uncertain"
+    with task_lock():
+        task = load_task(task_id)
+        if task is None:
+            log(f"send task={task_id}: task vanished mid-send "
+                f"(outcome {final_status})")
+            return outcome
+        rec = {**outcome, "at": now_ms(), "done_upto": done_upto}
+        if failure is not None and pending:
+            rec["pending"] = pending
+        task["status"] = final_status
+        task["send"] = rec
+        save_task(task)
+    if final_status == "sent":
+        update_heartbeat(last_send_ok_at=now_ms())
+    log(f"send task={task_id} -> {final_status} attempts={attempts} "
+        f"parts={parts_sent}/{parts}"
+        + (f" error={failure.kind}:{_scrub(failure)}" if failure else ""))
+    return outcome
+
+
+def flush_outbox(index: list | None = None) -> list[dict]:
+    results = []
+    now = now_ms()
+    deferred = rate_limited_until()
+    for t in (scan_task_index() if index is None else index):
+        send = t.get("send") or {}
+        due_retry = (
+            t["status"] == "send_failed"
+            and not send.get("no_auto_retry")
+            and int(send.get("attempts", 1))
+            < int(send.get("max_attempts") or SEND_MAX_ATTEMPTS)
+            and int(send.get("next_retry_at", 0)) <= now
+        )
+        if t["status"] == "waiting_send" or due_retry:
+            if deferred:
+                continue      # iLink -2: wait it out (a user message lifts it)
+            results.append({"task_id": t["message_id"],
+                            **attempt_send(t["message_id"],
+                                           allow_retry=due_retry)})
+    return results
+
+
+# --------------------------------------------------------------------------
+# serve: long-poll receiver thread + sender thread (single instance)
+# --------------------------------------------------------------------------
+
+_stop = threading.Event()
+_send_wake = threading.Event()   # SIGUSR1 (reply handoff) wakes the sender
+_SERVE_CREDS: dict = {}          # credentials currently used by serve
+
+
+def receiver_loop(creds: dict) -> None:
+    cursor = (read_json(CURSOR_FILE, {}) or {}).get("get_updates_buf", "") or ""
+    creds_sig = _file_sig(CREDS_FILE)
+    _SERVE_CREDS["creds"] = creds
+    if cursor:
+        log(f"resuming from saved cursor ({len(cursor)} bytes)")
+    next_timeout = LONG_POLL_DEFAULT_MS
+    saved_cursor = cursor
+    failures = 0
+    business_error_streak = 0
+    # Presence maintenance: the "temporarily unable to connect" title
+    # in WeChat is driven by notifyStart + poll liveness. A one-shot
+    # notifyStart that fails during a network flap used to leave the
+    # bot showing offline until the next process restart, so keep
+    # retrying (<=1 attempt / 20s), refresh every 10 minutes, and
+    # refresh immediately after any poll-failure streak recovers.
+    presence_ok = False
+    last_presence_attempt = 0.0
+    last_presence_ok = 0.0
+    while not _stop.is_set():
+        # A re-login (wait-login) rewrites credentials.json: switch to the
+        # new token with a fresh cursor instead of polling with the dead one
+        # until someone restarts the service.
+        sig = _file_sig(CREDS_FILE)
+        if sig != creds_sig:
+            creds_sig = sig
+            fresh = load_creds()
+            if fresh and fresh.get("bot_token") != creds.get("bot_token"):
+                creds = fresh
+                _SERVE_CREDS["creds"] = fresh
+                cursor = saved_cursor = ""
+                with contextlib.suppress(OSError):
+                    atomic_write_json(CURSOR_FILE, {"get_updates_buf": ""})
+                presence_ok = False
+                last_presence_attempt = 0.0
+                failures = business_error_streak = 0
+                log("credentials changed on disk: polling with the new "
+                    "login, no restart needed")
+        now_s = time.time()
+        if (not presence_ok or now_s - last_presence_ok > 600) \
+                and now_s - last_presence_attempt > 20:
+            last_presence_attempt = now_s
+            if notify(creds, start=True):
+                presence_ok = True
+                last_presence_ok = now_s
+        session = read_json(SESSION_FILE, {}) or {}
+        paused_until = session.get("paused_until_ms") or 0
+        if paused_until > now_ms():
+            wait = min(30, (paused_until - now_ms()) / 1000)
+            log(f"session paused (stale token), waiting {int(wait)}s")
+            _stop.wait(wait)
+            continue
+        try:
+            resp = get_updates(creds, cursor, next_timeout)
+        except ApiError as e:
+            failures += 1
+            # detail = failure layer (dns/refused/timeout/tls/closed/reset/
+            # tunnel...), URL-free: ops/report.py tallies it per layer.
+            log(f"getUpdates error ({failures}) kind={e.kind} "
+                f"detail={_scrub(e)}")
+            # Publish the failure streak so the hook can tell an
+            # actively-failing serve (dead proxy) apart from a merely
+            # slow first poll, and fast-fail it (see hook fast-path).
+            update_heartbeat(poll_fail_streak=failures,
+                             last_poll_fail_at=now_ms())
+            _stop.wait(POLL_RETRY_DELAYS_SEC[
+                min(failures - 1, len(POLL_RETRY_DELAYS_SEC) - 1)])
+            continue
+        except Exception as e:  # noqa: BLE001 - the poll loop must never die
+            failures += 1
+            log(f"getUpdates unexpected error ({failures}) "
+                f"type={type(e).__name__}")
+            update_heartbeat(poll_fail_streak=failures,
+                             last_poll_fail_at=now_ms())
+            _stop.wait(POLL_RETRY_DELAYS_SEC[
+                min(failures - 1, len(POLL_RETRY_DELAYS_SEC) - 1)])
+            continue
+        ret = resp.get("ret")
+        errcode = resp.get("errcode")
+        if (ret not in (None, 0)) or (errcode not in (None, 0)):
+            code = errcode if errcode not in (None, 0) else ret
+            if code == STALE_ERRCODE:
+                prev = read_json(SESSION_FILE, {}) or {}
+                stale_count = int(prev.get("stale_count") or 0) + 1
+                atomic_write_json(SESSION_FILE,
+                                  {"paused_until_ms": now_ms() + SESSION_PAUSE_MS,
+                                   "reason": "stale_token_-14",
+                                   "stale_count": stale_count,
+                                   "cursor_reset_at": prev.get("cursor_reset_at")})
+                failures = 0
+                log("getUpdates stale token (-14): pausing session for 1 hour")
+                if stale_count >= 2:
+                    # One pause did not heal it: the token is probably dead
+                    # and a human re-login is needed. Alert via state file;
+                    # the Muse hook turns this into a main-chat notice.
+                    atomic_write_json(STATE_DIR / "auth_alert.json",
+                                      {"at": now_ms(),
+                                       "reason": "repeated_stale_token",
+                                       "stale_count": stale_count})
+                    log("auth alert raised: repeated stale token")
+                continue
+            if code == RATE_LIMIT_ERRCODE:
+                # Rate limited: hammering makes it worse, and it says nothing
+                # about the cursor - keep it out of the wedged-cursor reset.
+                failures += 1
+                log(f"getUpdates rate limited (-2) ({failures}); retrying "
+                    f"in {RATE_LIMIT_POLL_RETRY_SEC}s")
+                _stop.wait(RATE_LIMIT_POLL_RETRY_SEC)
+                continue
+            business_error_streak += 1
+            if business_error_streak >= 15:
+                # A cursor the server no longer accepts can wedge polling
+                # forever. Reset it once per hour at most; inbound dedupe
+                # by message_id makes a reset safe against duplicates.
+                prev = read_json(SESSION_FILE, {}) or {}
+                last_reset = int(prev.get("cursor_reset_at") or 0)
+                if now_ms() - last_reset > SESSION_PAUSE_MS:
+                    cursor = saved_cursor = ""
+                    atomic_write_json(CURSOR_FILE, {"get_updates_buf": ""})
+                    prev["cursor_reset_at"] = now_ms()
+                    atomic_write_json(SESSION_FILE, prev)
+                    business_error_streak = 0
+                    log("getUpdates: reset wedged cursor after repeated "
+                        "business errors")
+            failures += 1
+            log(f"getUpdates business error ret={ret} errcode={errcode} "
+                f"errmsg={_scrub(resp.get('errmsg') or '')[:60]} ({failures})")
+            _stop.wait(POLL_RETRY_DELAYS_SEC[
+                min(failures - 1, len(POLL_RETRY_DELAYS_SEC) - 1)])
+            continue
+        if failures > 0:
+            # Polling just recovered: refresh presence right away so
+            # the "unable to connect" title clears promptly.
+            last_presence_ok = 0.0
+        failures = 0
+        business_error_streak = 0
+        prev_session = read_json(SESSION_FILE, {}) or {}
+        if prev_session.get("stale_count"):
+            prev_session["stale_count"] = 0
+            atomic_write_json(SESSION_FILE, prev_session)
+            (STATE_DIR / "auth_alert.json").unlink(missing_ok=True)
+        if resp.get("longpolling_timeout_ms"):
+            next_timeout = int(resp["longpolling_timeout_ms"])
+        new_cursor = resp.get("get_updates_buf")
+        if new_cursor:
+            cursor = new_cursor      # in memory now; persisted below
+        update_heartbeat(last_poll_ok_at=now_ms(), poll_fail_streak=0)
+        for m in resp.get("msgs") or []:
+            try:
+                ingest_message(creds, m)
+            except Exception as e:  # noqa: BLE001 - keep polling
+                log(f"ingest error: {e}")
+        # At-least-once delivery: the cursor used to be saved BEFORE the
+        # messages were stored, so a restart in between lost them for good
+        # (the server never resends past the cursor). Now it is saved only
+        # after the whole batch is on disk; message_id dedupe makes a
+        # redelivery after a crash harmless.
+        if cursor != saved_cursor:
+            try:
+                atomic_write_json(CURSOR_FILE, {"get_updates_buf": cursor})
+                saved_cursor = cursor
+            except OSError as e:
+                log(f"cursor save failed: {type(e).__name__}")
+    # No notifyStop here on purpose: serve exits are almost always
+    # restarts (upgrades, crash recovery, VM replacement), and telling
+    # the server "stopped" on every restart made WeChat show
+    # "temporarily unable to connect" long after polling had resumed.
+    # A deliberate full stop is signalled by `bridge.py stop` instead.
+
+
+PRUNE_AFTER_MS = 30 * 24 * 3600 * 1000
+_last_prune_epoch = 0.0
+
+
+def prune_old_tasks() -> None:
+    """Drop terminal-state tasks (and their downloaded media) older
+    than 30 days so the inbox cannot grow without bound."""
+    cutoff = now_ms() - PRUNE_AFTER_MS
+    for t in list_tasks():
+        # send_uncertain is deliberately NOT pruned: it awaits a human
+        # resend decision, however long that takes.
+        if t.get("status") not in ("sent", "send_failed"):
+            continue
+        if (t.get("received_at") or 0) >= cutoff:
+            continue
+        for key in ("media_path", "thumb_path"):
+            mp = t.get(key) or ""
+            if mp.startswith((str(MEDIA_DIR), str(FILES_DIR))):
+                try:
+                    os.unlink(mp)
+                except OSError:
+                    pass
+        try:
+            task_path(t["message_id"]).unlink()
+            log(f"pruned old task id={t['message_id']}")
+        except OSError:
+            pass
+
+
+def recover_stale_sending(index: list | None = None) -> None:
+    """A serve that dies mid-send leaves tasks in "sending" - the API
+    call may or may not have been accepted, and flush_outbox rightly
+    never touches them again. Convert any "sending" older than 120s
+    to send_uncertain (never auto-resent) so the hook surfaces it for
+    a human resend decision instead of the reply silently vanishing."""
+    cutoff = now_ms() - 120_000
+    for t in (scan_task_index() if index is None else index):
+        if t.get("status") != "sending":
+            continue
+        started = int((t.get("send") or {}).get("started_at") or 0)
+        if not started or started >= cutoff:
+            continue
+        with task_lock():
+            fresh = load_task(t["message_id"])
+            if fresh and fresh.get("status") == "sending":
+                fresh["status"] = "send_uncertain"
+                fresh["send"] = {
+                    **(fresh.get("send") or {}),
+                    "no_auto_retry": True,
+                    "error": "serve interrupted mid-send; result "
+                             "unknown, not retried",
+                }
+                save_task(fresh)
+                log(f"recovered stale sending task={t['message_id']} "
+                    "-> send_uncertain")
+
+
+def sender_loop() -> None:
+    global _last_prune_epoch
+    last_stats = 0.0
+    while not _stop.is_set():
+        _send_wake.clear()
+        try:
+            idx = scan_task_index()
+            recover_stale_sending(idx)
+            flush_outbox(idx)
+        except Exception as e:  # noqa: BLE001
+            log(f"sender loop error: {e}")
+        if time.time() - _last_prune_epoch > 3600:
+            _last_prune_epoch = time.time()
+            try:
+                prune_old_tasks()
+            except Exception as e:  # noqa: BLE001
+                log(f"prune error: {e}")
+        if time.monotonic() - last_stats > 60:
+            last_stats = time.monotonic()
+            with contextlib.suppress(Exception):
+                PROXY_POOL.publish_stats()
+        _send_wake.wait(1)       # SIGUSR1 from a reply handoff: no 1 s lag
+
+
+# --------------------------------------------------------------------------
+# "Typing..." indicator while a task is being worked on (official plugin:
+# getconfig -> typing_ticket, cached per user with a random refresh inside
+# 24 h and exponential retry 2 s .. 1 h; sendtyping status 1 with a 5 s
+# keepalive, status 2 to cancel). The executor can take minutes; until now
+# the user saw nothing at all in that time. Best effort only: failures are
+# logged at most once a minute and never touch task state.
+# Disable with WECHAT_BRIDGE_TYPING=0.
+# --------------------------------------------------------------------------
+
+TYPING_ENABLED = os.environ.get("WECHAT_BRIDGE_TYPING", "1") != "0"
+TYPING_KEEPALIVE_SEC = 5
+TYPING_MAX_MS = 10 * 60 * 1000
+TYPING_STATUSES = ("downloading", "pending_execution", "executing")
+CONFIG_TTL_SEC = 24 * 3600
+CONFIG_RETRY_MIN_SEC = 2
+CONFIG_RETRY_MAX_SEC = 3600
+
+
+class TypingManager:
+    def __init__(self) -> None:
+        self._tickets: dict = {}
+        self._typing: dict = {}
+        self._quiet_until = 0.0
+        self._last_err_log = 0.0
+        self.sent = 0
+
+    def _log_err(self, msg: str) -> None:
+        if time.monotonic() - self._last_err_log > 60:
+            self._last_err_log = time.monotonic()
+            log(f"typing: {msg} (best effort; muted for 60s)")
+
+    def _ticket(self, creds: dict, user: str) -> str:
+        now = time.time()
+        entry = self._tickets.get(user)
+        if entry is not None and now < entry["next_fetch"]:
+            return entry["ticket"]
+        ok = False
+        try:
+            resp = bot_post(creds, "ilink/bot/getconfig",
+                            {"ilink_user_id": user,
+                             "context_token": latest_context_token(user)[0]},
+                            timeout=10)
+            ret = resp.get("ret")
+            if ret == 0 or (ret is None and resp.get("typing_ticket")):
+                self._tickets[user] = {
+                    "ticket": resp.get("typing_ticket") or "",
+                    "next_fetch": now + random.random() * CONFIG_TTL_SEC,
+                    "retry": CONFIG_RETRY_MIN_SEC}
+                ok = True
+            else:
+                self._log_err(f"getconfig ret={ret}")
+        except ApiError as exc:
+            self._log_err(f"getconfig failed ({exc.kind})")
+        if not ok:
+            prev = (entry or {}).get("retry", CONFIG_RETRY_MIN_SEC / 2)
+            delay = min(prev * 2, CONFIG_RETRY_MAX_SEC)
+            self._tickets[user] = {"ticket": (entry or {}).get("ticket", ""),
+                                   "next_fetch": now + delay, "retry": delay}
+        return self._tickets[user]["ticket"]
+
+    def _send(self, creds: dict, user: str, ticket: str, status: int) -> bool:
+        try:
+            resp = bot_post(creds, "ilink/bot/sendtyping",
+                            {"ilink_user_id": user, "typing_ticket": ticket,
+                             "status": status}, timeout=10)
+        except ApiError as exc:
+            self._log_err(f"sendtyping failed ({exc.kind})")
+            return False
+        ret = resp.get("ret")
+        if ret not in (None, 0):
+            if ret == RATE_LIMIT_ERRCODE:
+                self._quiet_until = (time.monotonic()
+                                     + RATE_LIMIT_RETRY_MS / 1000)
+            self._log_err(f"sendtyping ret={ret}")
+            return False
+        self.sent += 1
+        return True
+
+    def tick(self, creds: dict | None, index: list) -> None:
+        if not creds or not TYPING_ENABLED:
+            return
+        mono = time.monotonic()
+        if mono < self._quiet_until or rate_limited_until():
+            return
+        session = read_json(SESSION_FILE, {}) or {}
+        if int(session.get("paused_until_ms") or 0) > now_ms():
+            return
+        cutoff = now_ms() - TYPING_MAX_MS
+        active = {t.get("from_user_id") for t in index
+                  if t.get("from_user_id")
+                  and t.get("status") in TYPING_STATUSES
+                  and (t.get("received_at") or 0) >= cutoff}
+        for user in active:
+            last = self._typing.get(user)
+            if last is not None and mono - last < TYPING_KEEPALIVE_SEC:
+                continue
+            ticket = self._ticket(creds, user)
+            if not ticket:
+                continue
+            self._typing[user] = mono
+            self._send(creds, user, ticket, 1)
+        for user in [u for u in self._typing if u not in active]:
+            del self._typing[user]
+            ticket = (self._tickets.get(user) or {}).get("ticket")
+            if ticket:
+                self._send(creds, user, ticket, 2)
+
+
+TYPING = TypingManager()
+
+
+def typing_loop() -> None:
+    while not _stop.is_set():
+        try:
+            TYPING.tick(_SERVE_CREDS.get("creds"), scan_task_index())
+        except Exception as e:  # noqa: BLE001 - best effort, never dies
+            log(f"typing loop error: {type(e).__name__}")
+        _stop.wait(1)
+
+
+def cmd_serve(args) -> int:
+    creds = load_creds()
+    if not creds:
+        print(json.dumps({"ok": False,
+                          "error": "no credentials; run login + wait-login first"},
+                         ensure_ascii=False))
+        return 2
+    # single instance via PID lock
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(STATE_DIR / "serve.lock", "a+")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({"ok": False, "error": "serve already running"},
+                         ensure_ascii=False))
+        return 2
+    PID_FILE.write_text(str(os.getpid()))
+    update_heartbeat(serve_pid=os.getpid(), serve_started_at=now_ms())
+
+    class GracefulStop(BaseException):
+        # BaseException: as an Exception the receiver loop's `except
+        # Exception` swallowed it, logging a bogus "getUpdates unexpected
+        # error ... GracefulStop" (and a poll failure in the heartbeat) on
+        # every stop/restart, which inflated report.py / doctor error counts.
+        pass
+
+    def handle_signal(signum, frame):
+        _stop.set()
+        # Raising here interrupts the blocking long-poll request at once
+        # (PEP 475 retries only when the handler returns normally), so a
+        # stop does not have to wait out the poll or be SIGKILLed.
+        raise GracefulStop()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    # `complete` / send-direct hand replies to this process (warm keep-alive
+    # connections) and wake the sender with SIGUSR1. Advertised in the
+    # heartbeat so a CLI never signals an older serve without this handler
+    # (SIGUSR1's default action would kill it).
+    signal.signal(signal.SIGUSR1, lambda signum, frame: _send_wake.set())
+    update_heartbeat(handoff_pid=os.getpid())
+    _SERVE_CREDS["creds"] = creds
+    log(f"serve starting pid={os.getpid()} bot={mask(creds.get('ilink_bot_id'))}")
+    PROXY_POOL.start_rotator()
+    t_send = threading.Thread(target=sender_loop, daemon=True)
+    t_send.start()
+    for _ in range(MEDIA_WORKERS):
+        threading.Thread(target=media_worker_loop, daemon=True).start()
+    threading.Thread(target=typing_loop, name="typing", daemon=True).start()
+    try:
+        recover_downloading()
+    except Exception as e:  # noqa: BLE001
+        log(f"recover_downloading error: {type(e).__name__}")
+    try:
+        receiver_loop(creds)
+    except GracefulStop:
+        log("serve stopping (signal)")
+    finally:
+        _stop.set()
+        _send_wake.set()
+        PID_FILE.unlink(missing_ok=True)
+        update_heartbeat(handoff_pid=None)
+        log("serve stopped")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# claim / complete / send / status / stop
+# --------------------------------------------------------------------------
+
+STALE_EXECUTING_MS = 10 * 60 * 1000
+
+
+_EXEC_MEDIA_FIELDS = ("media_path", "file_name", "play_length", "media_error")
+_EXEC_OPTIONAL_FIELDS = ("media_bytes", "thumb_path")
+
+
+def _executor_view(t: dict) -> dict:
+    """What the executor agent needs, nothing more. The full task carries
+    raw_items (CDN query params, AES keys), context_token and bookkeeping
+    that only cost LLM tokens and put credential-adjacent values into the
+    model context. `claim --full` returns the old complete record."""
+    out = {"message_id": t["message_id"], "kind": t.get("kind"),
+           "text": t.get("text") or ""}
+    if t.get("quote"):
+        out["quote"] = t["quote"]      # the message the user is replying to
+    if t.get("kind") != "text":
+        for k in _EXEC_MEDIA_FIELDS:
+            out[k] = t.get(k)
+        for k in _EXEC_OPTIONAL_FIELDS:
+            if t.get(k) is not None:
+                out[k] = t[k]
+    return out
+
+
+def cmd_claim(args) -> int:
+    with task_lock():
+        # Reclaim tasks whose executor died mid-run (e.g. runtime replaced):
+        # an "executing" task untouched for 10+ minutes goes back to pending.
+        now = now_ms()
+        for s_ in scan_task_index():
+            if s_["status"] != "executing":
+                continue
+            claimed_at = int(s_.get("claimed_at") or 0)
+            if claimed_at and now - claimed_at > STALE_EXECUTING_MS:
+                t = load_task(s_["message_id"])
+                if t and t.get("status") == "executing":
+                    t["status"] = "pending_execution"
+                    t["execution"] = {**(t.get("execution") or {}),
+                                      "reclaimed_at": now_ms(),
+                                      "reclaim_reason": "stale_executing"}
+                    save_task(t)
+                    log(f"reclaimed stale executing task id={t['message_id']}")
+        pending = [x for x in scan_task_index()
+                   if x["status"] == "pending_execution"]
+        claimed = []
+        for s_ in pending[: args.limit]:
+            t = load_task(s_["message_id"])
+            if not t or t.get("status") != "pending_execution":
+                continue
+            t["status"] = "executing"
+            t["execution"] = {"claimed_at": now_ms(), "by": "muse"}
+            save_task(t)
+            claimed.append(t)
+    view = claimed if args.full else [_executor_view(t) for t in claimed]
+    print(json.dumps({"ok": True, "tasks": view}, ensure_ascii=False))
+    return 0
+
+
+HANDOFF_PICKUP_SEC = 8
+HANDOFF_FINISH_SEC = 90
+_TERMINAL_SEND = ("sent", "send_failed", "send_uncertain")
+
+
+def _handoff_target() -> int | None:
+    if os.environ.get("WECHAT_BRIDGE_HANDOFF", "1") == "0":
+        return None
+    pid = serve_alive()
+    if not pid:
+        return None
+    hb = read_json(HEARTBEAT_FILE, {}) or {}
+    if hb.get("handoff_pid") != pid or hb.get("serve_pid") != pid:
+        return None       # an older serve: SIGUSR1 would kill it
+    return pid
+
+
+def _send_result(t: dict) -> dict:
+    rec = {k: v for k, v in (t.get("send") or {}).items()
+           if k not in ("pending", "at", "started_at", "done_upto")}
+    rec["ok"] = t.get("status") == "sent"
+    return rec
+
+
+def deliver(task_id: str) -> dict:
+    """Send a waiting_send task, preferably through the running serve: its
+    sender wakes on SIGUSR1 and reuses a warm keep-alive connection (the
+    typing keepalive keeps one warm), so the reply skips a fresh
+    TCP + CONNECT + TLS setup on the critical path. Falls back to sending
+    from this process if the serve does not pick it up within 8 s."""
+    deadline = time.monotonic() + HANDOFF_FINISH_SEC
+    pid = _handoff_target()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGUSR1)
+        except OSError:
+            pid = None
+    if pid:
+        pickup = time.monotonic() + HANDOFF_PICKUP_SEC
+        while time.monotonic() < deadline:
+            t = load_task(task_id) or {}
+            if not t:
+                return {"ok": False, "error": "task not found"}
+            if t.get("status") in _TERMINAL_SEND:
+                return {**_send_result(t), "via": "serve"}
+            if t.get("status") == "waiting_send" and time.monotonic() > pickup:
+                log(f"handoff: serve did not pick up task={task_id} in "
+                    f"{HANDOFF_PICKUP_SEC}s; sending directly")
+                break
+            time.sleep(0.05)
+    outcome = attempt_send(task_id)
+    if not outcome.get("ok") and "status is sending" in str(outcome.get("error")):
+        while time.monotonic() < deadline:       # the serve won the race
+            t = load_task(task_id) or {}
+            if t.get("status") in _TERMINAL_SEND:
+                return {**_send_result(t), "via": "serve"}
+            time.sleep(0.1)
+        return {"ok": False, "pending": True,
+                "error": "serve still sending; check status later"}
+    return outcome
+
+
+def cmd_complete(args) -> int:
+    if args.result_file:
+        result_text = Path(args.result_file).read_text(encoding="utf-8")
+    else:
+        result_text = args.result or ""
+    with task_lock():
+        task = load_task(args.task_id)
+        if not task:
+            print(json.dumps({"ok": False, "error": "task not found"},
+                             ensure_ascii=False))
+            return 2
+        if task["status"] == "sent":
+            print(json.dumps({"ok": False, "error": "task already sent"},
+                             ensure_ascii=False))
+            return 2
+        if args.error:
+            task["execution"] = {**(task.get("execution") or {}),
+                                 "finished_at": now_ms(), "error": args.error}
+            task["result_text"] = f"任务执行失败：{args.error}"
+        else:
+            task["execution"] = {**(task.get("execution") or {}),
+                                 "finished_at": now_ms(), "ok": True}
+            task["result_text"] = result_text
+        task["status"] = "waiting_send"
+        save_task(task)
+    outcome = deliver(args.task_id)
+    print(json.dumps({"ok": True, "task_id": args.task_id, "send": outcome},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_send(args) -> int:
+    # A manual send is a human decision (EXECUTOR.md: resend only after the
+    # user confirms), so it may resume send_uncertain / exhausted tasks.
+    # Parts already confirmed are never sent again; the part that was in
+    # flight goes out again with its original client_id.
+    outcome = attempt_send(args.task_id, allow_retry=True, force=True)
+    print(json.dumps(outcome, ensure_ascii=False))
+    return 0 if outcome.get("ok") else 1
+
+
+def cmd_send_image(args) -> int:
+    """Send a local image file directly to WeChat (CDN upload + image
+    item). --task-id resolves recipient + context token from that
+    task; --to-user overrides the recipient. Does not change task
+    status, so it pairs with a normal `complete` text reply."""
+    creds = load_creds()
+    if not creds:
+        print(json.dumps({"ok": False, "error": "no credentials"},
+                         ensure_ascii=False))
+        return 2
+    to_user = args.to_user
+    context_token = args.context_token
+    if args.task_id:
+        task = load_task(args.task_id)
+        if not task:
+            print(json.dumps({"ok": False, "error": "task not found"},
+                             ensure_ascii=False))
+            return 2
+        to_user = to_user or task.get("from_user_id")
+        context_token = context_token or task.get("context_token")
+    if to_user and not context_token:
+        context_token = latest_context_token(to_user)[0]
+    if not to_user:
+        print(json.dumps({"ok": False,
+                          "error": "need --task-id or --to-user"},
+                         ensure_ascii=False))
+        return 2
+    try:
+        outcome = send_image(creds, to_user, Path(args.file),
+                             context_token, caption=args.caption)
+    except ApiError as e:
+        print(json.dumps({"ok": False, "error": f"{e.kind}: {e}"},
+                         ensure_ascii=False))
+        return 1
+    except Exception as e:  # noqa: BLE001 - surface the real failure
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"},
+                         ensure_ascii=False))
+        return 1
+    print(json.dumps(outcome, ensure_ascii=False))
+    return 0
+
+
+def cmd_send_file(args) -> int:
+    """Send a local file attachment directly to WeChat (CDN upload +
+    file item). Mirrors cmd_send_image; does not change task status."""
+    creds = load_creds()
+    if not creds:
+        print(json.dumps({"ok": False, "error": "no credentials"},
+                         ensure_ascii=False))
+        return 2
+    to_user = args.to_user
+    context_token = args.context_token
+    if args.task_id:
+        task = load_task(args.task_id)
+        if not task:
+            print(json.dumps({"ok": False, "error": "task not found"},
+                             ensure_ascii=False))
+            return 2
+        to_user = to_user or task.get("from_user_id")
+        context_token = context_token or task.get("context_token")
+    if to_user and not context_token:
+        context_token = latest_context_token(to_user)[0]
+    if not to_user:
+        print(json.dumps({"ok": False,
+                          "error": "need --task-id or --to-user"},
+                         ensure_ascii=False))
+        return 2
+    try:
+        outcome = send_file(creds, to_user, Path(args.file),
+                            context_token, caption=args.caption)
+    except ApiError as e:
+        print(json.dumps({"ok": False, "error": f"{e.kind}: {e}"},
+                         ensure_ascii=False))
+        return 1
+    except Exception as e:  # noqa: BLE001 - surface the real failure
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"},
+                         ensure_ascii=False))
+        return 1
+    print(json.dumps(outcome, ensure_ascii=False))
+    return 0
+
+
+def cmd_send_video(args) -> int:
+    """Send a local video directly to WeChat (CDN upload + video
+    item). Mirrors cmd_send_file; does not change task status."""
+    creds = load_creds()
+    if not creds:
+        print(json.dumps({"ok": False, "error": "no credentials"},
+                         ensure_ascii=False))
+        return 2
+    to_user = args.to_user
+    context_token = args.context_token
+    if args.task_id:
+        task = load_task(args.task_id)
+        if not task:
+            print(json.dumps({"ok": False, "error": "task not found"},
+                             ensure_ascii=False))
+            return 2
+        to_user = to_user or task.get("from_user_id")
+        context_token = context_token or task.get("context_token")
+    if to_user and not context_token:
+        context_token = latest_context_token(to_user)[0]
+    if not to_user:
+        print(json.dumps({"ok": False,
+                          "error": "need --task-id or --to-user"},
+                         ensure_ascii=False))
+        return 2
+    try:
+        outcome = send_video(creds, to_user, Path(args.file),
+                             context_token, caption=args.caption)
+    except ApiError as e:
+        print(json.dumps({"ok": False, "error": f"{e.kind}: {e}"},
+                         ensure_ascii=False))
+        return 1
+    except Exception as e:  # noqa: BLE001 - surface the real failure
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"},
+                         ensure_ascii=False))
+        return 1
+    print(json.dumps(outcome, ensure_ascii=False))
+    return 0
+
+
+def cmd_flush(args) -> int:
+    print(json.dumps({"ok": True, "results": flush_outbox()}, ensure_ascii=False))
+    return 0
+
+
+def serve_alive() -> int | None:
+    try:
+        pid_val = int(PID_FILE.read_text().strip())
+        os.kill(pid_val, 0)
+        # Guard against PID reuse: the process must actually be our
+        # serve, not an unrelated process that inherited the number.
+        cmdline = Path(f"/proc/{pid_val}/cmdline").read_bytes() \
+            .replace(b"\0", b" ").decode(errors="replace")
+        if "bridge.py" not in cmdline or "serve" not in cmdline:
+            return None
+        return pid_val
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_status(args) -> int:
+    creds = load_creds()
+    counts: dict[str, int] = {}
+    for t in scan_task_index():
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+    hb = read_json(HEARTBEAT_FILE, {}) or {}
+    session = read_json(SESSION_FILE, {}) or {}
+    cursor = (read_json(CURSOR_FILE, {}) or {}).get("get_updates_buf", "") or ""
+    status = {
+        "connected": bool(creds),
+        "ilink_bot_id": mask(creds.get("ilink_bot_id")) if creds else None,
+        "ilink_user_id": mask(creds.get("ilink_user_id")) if creds else None,
+        "baseurl": api_base(creds) if creds else None,
+        "saved_at": creds.get("saved_at") if creds else None,
+        "serve_pid": serve_alive(),
+        "cursor_bytes": len(cursor),
+        "session_paused_until_ms": session.get("paused_until_ms"),
+        "tasks_by_status": counts,
+        "last_poll_ok_at": hb.get("last_poll_ok_at"),
+        "last_inbound_at": hb.get("last_inbound_at"),
+        "last_send_ok_at": hb.get("last_send_ok_at"),
+        "proxy_id": hb.get("proxy_id"),
+        "proxy_rotations": hb.get("proxy_rotations"),
+        "net_connects": hb.get("net_connects"),
+        "net_reused": hb.get("net_reused"),
+        "typing_sent": hb.get("typing_sent"),
+        "rate_limited_until_ms": rate_limited_until() or None,
+        "send_chunk_limit": _chunk_limit(),
+        "login_status": (read_json(LOGIN_STATUS_FILE, {}) or {}).get("status"),
+        "auth_alert": read_json(STATE_DIR / "auth_alert.json"),
+    }
+    print(json.dumps(status, ensure_ascii=False, indent=2))
+    return 0
+
+
+PROXY_ENV_FILE = STATE_DIR / "proxy.env"
+PROXY_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+              "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY")
+
+
+def cmd_write_proxy_env(args) -> int:
+    """Copy this process's proxy variables into state/proxy.env (0600)
+    so the systemd service (which starts with a clean environment and
+    cannot reach the internet directly in this runtime) can use the
+    same egress proxy. Values are never printed."""
+    lines, written = [], []
+    for name in PROXY_VARS:
+        value = os.environ.get(name)
+        if value:
+            lines.append(f"{name}={value}")
+            written.append(name)
+    if not written:
+        print(json.dumps({"ok": False,
+                          "error": "no proxy variables in this environment"},
+                         ensure_ascii=False))
+        return 2
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PROXY_ENV_FILE.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PROXY_ENV_FILE)
+    print(json.dumps({"ok": True, "written_vars": written,
+                      "file": str(PROXY_ENV_FILE)}, ensure_ascii=False))
+    return 0
+
+
+def cmd_stop(args) -> int:
+    pid_val = serve_alive()
+    if not pid_val:
+        print(json.dumps({"ok": True, "note": "serve not running"},
+                         ensure_ascii=False))
+        return 0
+    os.kill(pid_val, signal.SIGTERM)
+    for _ in range(50):
+        if not serve_alive():
+            break
+        time.sleep(0.1)
+    if not serve_alive():
+        # Deliberate stop (not a restart): tell the server explicitly.
+        creds = load_creds()
+        if creds:
+            notify(creds, start=False)
+    print(json.dumps({"ok": True, "stopped_pid": pid_val,
+                      "still_alive": bool(serve_alive())}, ensure_ascii=False))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Muse WeChat ClawBot bridge")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("login")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_login)
+
+    p = sub.add_parser("wait-login")
+    p.add_argument("--timeout", type=int, default=480)
+    p.add_argument("--verify-code", default=None)
+    p.set_defaults(fn=cmd_wait_login)
+
+    p = sub.add_parser("serve")
+    p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("send")
+    p.add_argument("--task-id", required=True)
+    p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser("send-image")
+    p.add_argument("--task-id", default=None)
+    p.add_argument("--to-user", default=None)
+    p.add_argument("--file", required=True)
+    p.add_argument("--caption", default=None)
+    p.add_argument("--context-token", default=None)
+    p.set_defaults(fn=cmd_send_image)
+
+    p = sub.add_parser("send-file")
+    p.add_argument("--task-id", default=None)
+    p.add_argument("--to-user", default=None)
+    p.add_argument("--file", required=True)
+    p.add_argument("--caption", default=None)
+    p.add_argument("--context-token", default=None)
+    p.set_defaults(fn=cmd_send_file)
+
+    p = sub.add_parser("send-video")
+    p.add_argument("--task-id", default=None)
+    p.add_argument("--to-user", default=None)
+    p.add_argument("--file", required=True)
+    p.add_argument("--caption", default=None)
+    p.add_argument("--context-token", default=None)
+    p.set_defaults(fn=cmd_send_video)
+
+    p = sub.add_parser("flush")
+    p.set_defaults(fn=cmd_flush)
+
+    p = sub.add_parser("status")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("claim")
+    p.add_argument("--limit", type=int, default=1)
+    p.add_argument("--full", action="store_true",
+                   help="return complete task records (default: slim)")
+    p.set_defaults(fn=cmd_claim)
+
+    p = sub.add_parser("complete")
+    p.add_argument("--task-id", required=True)
+    p.add_argument("--result", default=None)
+    p.add_argument("--result-file", default=None)
+    p.add_argument("--error", default=None)
+    p.set_defaults(fn=cmd_complete)
+
+    p = sub.add_parser("stop")
+    p.set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("write-proxy-env")
+    p.set_defaults(fn=cmd_write_proxy_env)
+
+    args = parser.parse_args()
+    for d in (STATE_DIR, INBOX_DIR, OUTBOX_DIR, LOG_DIR, MEDIA_DIR,
+              FILES_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    PROXY_POOL.init()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
