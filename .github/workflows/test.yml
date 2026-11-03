@@ -12,8 +12,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # The runner image preinstalls an importable cryptography (run #10
+      # proved it: the bare-import assertion failed in 3 s). Without a
+      # shadow, job 1 would silently test the cryptography backend twice
+      # and never exercise ctypes. The shadow package raises ImportError,
+      # so bridge.py falls through to ctypes exactly as on a machine
+      # without the package. It only affects this job's Python processes.
+      PYTHONPATH: ${{ github.workspace }}/.ci-no-crypto
     steps:
       - uses: actions/checkout@v4
+      - name: Simulate absence of cryptography (shadow package)
+        run: |
+          mkdir -p .ci-no-crypto/cryptography
+          printf 'raise ImportError("blocked: no-cryptography matrix")\n' > .ci-no-crypto/cryptography/__init__.py
       - name: Assert no-cryptography matrix (backend must be ctypes)
         run: |
           if python3 -c "import cryptography" 2>/dev/null; then
