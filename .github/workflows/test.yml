@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Install ffmpeg (voice tests generate audio with it)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Fixtures are tracked (gitignore must not exclude them)
         run: |
           git ls-files tests/fixtures | grep -q 'bridge.py.v1'
@@ -37,6 +39,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Install ffmpeg (voice tests generate audio with it)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install cryptography (the backend most dev machines have)
         run: python3 -m pip install --user cryptography
       - name: AES-sensitive suite under the cryptography backend
