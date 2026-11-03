@@ -95,7 +95,7 @@ QR_TXT = BASE_DIR / "qrcode.txt"
 QUEUE_DIR = OUTBOX_DIR / "queue"        # v4: outbound media queue items
 ATTACH_DIR = OUTBOX_DIR / "files"       # v4: private copies of attachments
 HISTORY_DIR = BASE_DIR / "history"      # v4: conversation history (not backed up)
-BRIDGE_VERSION = "5.0"
+BRIDGE_VERSION = "5.0.5"
 
 FIXED_BASE_URL = "https://ilinkai.weixin.qq.com"
 DEFAULT_BASE_URL = FIXED_BASE_URL
@@ -191,13 +191,17 @@ def atomic_write_text(path: Path, text: str, mode=0o600,
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(
         path.suffix + f".tmp{os.getpid()}.{threading.get_ident()}.{next(_tmp_seq)}")
+    # Create with 0600 and fchmod before writing anything: the old
+    # open-then-chmod order left a window where the tmp file sat at the
+    # umask mode (0660/0664 here) with content already in it.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, mode)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
-        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -780,6 +784,14 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     downgrade refusal stays URLError in both paths."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_method() not in ("GET", "HEAD"):
+            # Mirror the pool path, which only follows redirects for
+            # GET/HEAD and raises HTTPError for anything else: the stdlib
+            # handler would otherwise silently replay a POST as a GET at
+            # the new address, so a redirected sendmessage would look
+            # successful while its body never arrived.
+            raise urllib.error.HTTPError(req.full_url, code, msg,
+                                         headers, fp)
         old = urllib.parse.urlsplit(req.full_url)
         new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
         if old.scheme == "https" and new.scheme == "http":
@@ -7748,7 +7760,9 @@ def cmd_decisions(args) -> int:
     """Decision list (opt batch item 2): show, or append one in-progress item."""
     text = _decisions_read()
     if getattr(args, "add", None):
-        item = args.add.strip()
+        # Decisions are single-line bullets: a newline inside --add could
+        # smuggle in a "## ..." heading and break the file structure.
+        item = args.add.replace("\r", " ").replace("\n", " ").strip()
         marker = "\n## 已决定"
         entry = f"\n- {item}\n"
         if marker in text:

@@ -85,6 +85,15 @@ class EchoHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        # Only records: a replayed POST reaching B would land here.
+        record("echo-post", self)
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 def redirector(port_b):
     class H(BaseHTTPRequestHandler):
@@ -100,6 +109,8 @@ def redirector(port_b):
         def do_GET(self):
             if self.path == "/to-b":
                 self._redir(f"http://127.0.0.1:{port_b}/echo")
+            elif self.path == "/redir-post":
+                self._redir(f"http://127.0.0.1:{port_b}/echo")
             elif self.path == "/to-same":
                 self._redir("/echo")
             elif self.path == "/to-deny":
@@ -111,6 +122,17 @@ def redirector(port_b):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            if self.path == "/redir-post":
+                self._redir(f"http://127.0.0.1:{port_b}/echo")
             else:
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
@@ -203,7 +225,41 @@ def main():
           and got.get("Cookie") == "session=abc123",
           "pool same-origin keeps credentials", f"seen={got}")
 
-    # 7. Downgrade: refused as URLError in both modes. Needs a TLS server;
+    # 7. POST redirects are NOT replayed: both modes raise HTTPError 302
+    # and the target sees nothing. The stdlib handler would otherwise
+    # silently replay a POST as a GET, so a redirected sendmessage would
+    # look successful while its body never arrived.
+    def post_via(url, mode):
+        if mode == "fallback":
+            pool.enabled = False
+            pool.mode = "urllib"
+        else:
+            pool._opener = mod.KeepAliveOpener(None)
+            pool.enabled = True
+            pool.mode = "direct"
+        req = mod.urllib.request.Request(
+            url, data=b"sendmessage-body", method="POST")
+        return pool.open(req, timeout=10)
+
+    for name in ("fallback", "pool"):
+        with seen_lock:
+            seen.clear()
+        try:
+            with post_via(f"http://127.0.0.1:{port_a}/redir-post",
+                          name) as resp:
+                resp.read()
+            check(False, f"{name} POST redirect raises HTTPError 302")
+        except Exception as e:
+            check(isinstance(e, mod.urllib.error.HTTPError)
+                  and getattr(e, "code", None) == 302,
+                  f"{name} POST redirect raises HTTPError 302",
+                  f"{type(e).__name__}: {e}")
+        with seen_lock:
+            hit = "echo" in seen or "echo-post" in seen
+        check(not hit, f"{name} POST redirect never reaches target",
+              f"seen={dict(seen)}")
+
+    # 8. Downgrade: refused as URLError in both modes. Needs a TLS server;
     # the bridge verifies certs, so the test cert is trusted via SSL_CERT_FILE.
     if not shutil.which("openssl"):
         skipped.append("downgrade (no openssl CLI)")

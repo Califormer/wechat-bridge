@@ -259,7 +259,7 @@ finally:
         rc = None
         serve.kill()
 hist = proj / "history" / "chat.jsonl"
-check(rc == 0 and st.get("version") in ("4.0", "5.0") and st.get("voice_codec") == "pysilk"
+check(rc == 0 and str(st.get("version") or "").startswith(("4.", "5.")) and st.get("voice_codec") == "pysilk"
       and (st.get("queue") or {}).get("sent") == 2 and hist.exists() and (hist.stat().st_mode & 0o777) == 0o600,
       "status reports version, codec and the media queue; history file is 0600; SIGTERM exits cleanly",
       f"rc={rc} queue={st.get('queue')} voice_codec={st.get('voice_codec')}")
