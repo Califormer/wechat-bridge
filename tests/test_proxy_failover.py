@@ -163,14 +163,25 @@ def s_disabled_and_scrub(tmp):
     mod.PROXY_POOL.init()
     off = not mod.PROXY_POOL.enabled
     mod.PROXY_POOL.enabled = False
+    # NOTE: since the v5.0.3 urllib redirect guard, the disabled-pool path
+    # no longer calls urllib.request.urlopen directly; it builds an opener
+    # with _SafeRedirectHandler and calls opener.open. Intercept the opener
+    # path (urlopen patching would silently never fire).
     called = {}
-    real = mod.urllib.request.urlopen
-    mod.urllib.request.urlopen = lambda req, timeout=None: called.setdefault("y", 1) or (_ for _ in ()).throw(OSError())
+    real_build = mod.urllib.request.build_opener
+
+    class FakeOpener:
+        def open(self, req, timeout=None):
+            called["y"] = 1
+            raise OSError()
+
+    mod.urllib.request.build_opener = lambda *a, **k: FakeOpener()
     try:
         mod.PROXY_POOL.open(mod.urllib.request.Request(TARGET), 1)
     except OSError:
         pass
-    mod.urllib.request.urlopen = real
+    finally:
+        mod.urllib.request.build_opener = real_build
     scrubbed = mod._scrub("Tunnel failed for https://user:pw@10.0.0.1:8080/x end")
     return off and called and "pw" not in scrubbed and "<url>" in scrubbed, \
         f"socks_disables_pool={off}, passthrough_used={bool(called)}, scrub={scrubbed!r}"

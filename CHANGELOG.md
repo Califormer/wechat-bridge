@@ -18,6 +18,13 @@
   原先"全部离线测试"不准确）；测试分两遍跑，一遍装 cryptography、
   一遍不装（上轮 bug 只在装了时出现）；补 `permissions: contents: read`
   与 `timeout-minutes`。
+- CI 后续（测试侧修正）：运行 #6 中 test-cryptography 已绿，test 仍红在
+  test_proxy_failover 检查 4——v5.0.3 的 urllib 重定向守卫把停用池的
+  回退路径从直接 urlopen 改成了 build_opener(_SafeRedirectHandler).open，
+  而该检查仍靠 monkeypatch urlopen 来探测直通，导致探测点失效（本地
+  同样复现，非 runner 环境差异；先前回归结论误读了输出尾行，漏看了
+  检查 4 的失败）。修正：检查改 intercept build_opener 路径；桥代码
+  行为本身未变，_SafeRedirectHandler 的行为由 open_fixes 测试覆盖。
 - CI 修复（工作流提交 796f1a4）：首个 CI 运行因 runner 缺 ffmpeg 而失败
   （两任务同因：g_voice 生成音频时找不到 ffmpeg；本机有 ffmpeg 所以
   本地测不出来），工作流两任务补装 ffmpeg。注意：工作流文件只能走
