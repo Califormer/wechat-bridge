@@ -1,5 +1,24 @@
 # 更新日志
 
+## v5.0.1（开源包修正，2026-11-03；尚未回灌线上桥）
+
+- 文档：EXECUTOR.md 精简到 8000 字节以下，test_opt6 通过；bridge.py、
+  backup.sh、recover.sh、服务模板里残留的 OPS.md 引用改到 docs/OPERATIONS.md。
+- 可移植性：backup.sh 的项目目录、hook 目录、cron 定义全部改成环境变量可覆盖，
+  默认取脚本所在目录，不再硬编码私有路径；doctor.py 的 cron 检查同理（未配置则跳过）。
+  「最近文件」的归档目录改成 WECHAT_BRIDGE_ARCHIVE_DIR（默认 icloud-upload/），
+  不再以 iCloud 专有名词写进通用逻辑。
+- 代理：代理池只接受 http:// CONNECT 代理；https/socks 代理会记一条明确日志后停用池子，
+  不再假装接管。重定向：拒绝 https→http 降级，跨域重定向剥离 Authorization/Cookie。
+- 媒体 URL：服务端给的下载/上传地址只放行 https 的腾讯 CDN 域名（*.qq.com、*.qpic.cn、*.qlogo.cn），测试用
+  WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1 放行回环地址；相关测试 mock 已改成 qq.com 域名。
+- AES：优先 cryptography，其次系统 libcrypto（ctypes），最后回退 openssl 命令行并记警告；
+  密钥不再默认出现在 ps 里。test_v4_e2e 的原生语音场景改为显式开启（与 test_v4 一致），
+  此前它按旧默认期待原生语音，与语音发文件卡片的默认行为矛盾。
+- 服务模板：User=USERNAME（不再默认 root）、MemoryMax=2G、RestartSec=5、
+  WantedBy=multi-user.target。
+
+
 ## v5.0（当前版本）
 
 - 24 小时回复窗口与每条消息约 10 条回复额度：本地记账，超额挂起、

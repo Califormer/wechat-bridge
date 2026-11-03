@@ -161,6 +161,9 @@ shutil.copy(HERE / "ops" / "send-direct.py", proj / "ops" / "send-direct.py")
 env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
 env.update(https_proxy=px.url, HTTPS_PROXY=px.url, no_proxy="", NO_PROXY="",
            SSL_CERT_FILE=str(TMP / "c.pem"), WECHAT_BRIDGE_QUEUE_DELAYS_MS="300,500,800,1000,1000")
+# Native-voice scenario opts in explicitly (voice-file default since v5);
+# the fake CDN is loopback, so the media-URL allowlist needs the test flag.
+env.update(WECHAT_BRIDGE_NATIVE_VOICE="1", WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL="1")
 song = TMP / "song.mp3"
 song.write_bytes(os.urandom(200_000))
 voice = TMP / "voice.wav"

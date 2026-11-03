@@ -398,7 +398,7 @@ def g_cdn():
     small.write_bytes(os.urandom(300_000))
     creds = {"bot_token": "t"}
     b = load(NEW, "cdn")
-    b.bot_post = lambda c, ep, body, timeout: {"upload_full_url": "https://cdn.invalid/upload"}
+    b.bot_post = lambda c, ep, body, timeout: {"upload_full_url": "https://cdn.qq.com/upload"}
     b.CDN_RETRY_DELAYS_SEC = (0.01, 0.01)
     calls = []
 
@@ -456,6 +456,7 @@ def g_cdn():
     srv, px = TLSServer(), Proxy()
     use_proxy(px.url)
     b3 = load(NEW, "cdn_e2e")
+    os.environ["WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL"] = "1"
     b3.PROXY_POOL.init()
     b3.bot_post = lambda c, ep, body, timeout: {"upload_full_url": srv.base + "/upload?q=1"}
     doc = d / "doc.pdf"

@@ -613,9 +613,25 @@ class KeepAliveOpener:
                 pooled.read()
             pooled.close()
             if location and hops < 4:
+                new_url = urllib.parse.urljoin(url, location)
+                old_parts = urllib.parse.urlsplit(url)
+                new_parts = urllib.parse.urlsplit(new_url)
+                if old_parts.scheme == "https" and new_parts.scheme == "http":
+                    raise urllib.error.URLError(
+                        "refusing https->http redirect downgrade")
+                headers = dict(req.header_items())
+                old_origin = (old_parts.scheme, old_parts.hostname,
+                              old_parts.port)
+                new_origin = (new_parts.scheme, new_parts.hostname,
+                              new_parts.port)
+                if old_origin != new_origin:
+                    # Never leak caller credentials to another origin.
+                    for k in list(headers):
+                        if k.lower() in ("authorization", "cookie",
+                                         "proxy-authorization"):
+                            del headers[k]
                 nxt = urllib.request.Request(
-                    urllib.parse.urljoin(url, location),
-                    headers=dict(req.header_items()), method=method)
+                    new_url, headers=headers, method=method)
                 nxt._redirects = hops + 1
                 nxt.idempotent = True
                 return self.open(nxt, timeout)
@@ -660,9 +676,14 @@ def _proxy_id(url: str | None) -> str:
 
 
 def _proxy_url_ok(url: str) -> bool:
+    """Only plaintext http:// CONNECT proxies are supported by the pool.
+    An https:// proxy would need a TLS handshake to the proxy itself,
+    which the pool does not implement, and socks proxies are not spoken
+    at all, so both are rejected here instead of failing confusingly
+    later. Callers that cannot use the pool fall back to urllib."""
     try:
         parts = urllib.parse.urlsplit(url)
-        return parts.scheme in ("http", "https") and bool(parts.hostname)
+        return parts.scheme == "http" and bool(parts.hostname)
     except ValueError:
         return False
 
@@ -744,12 +765,16 @@ class ProxyPool:
         plain urlopen (a fresh TCP+TLS handshake for every request), and the
         systemd unit treats proxy.env as optional, so a missing file silently
         cost every call a handshake. Only a proxy scheme the pool cannot
-        speak (e.g. socks) is left to urllib."""
+        speak (https, socks) is left to urllib, with a clear log line:
+        urllib speaks plaintext CONNECT only, so such a proxy will fail
+        there too unless it happens to accept plaintext CONNECT."""
         url = _https_proxy_from(os.environ)
         if url and _proxy_url_ok(url):
             self._activate(url)
             self.enabled, self.mode = True, "proxy"
         elif url:
+            log("proxy scheme not supported by the pool (only http:// "
+                "CONNECT proxies): pool disabled, urllib fallback")
             self.enabled, self.mode = False, "urllib"
         else:
             self._opener = KeepAliveOpener(None)
@@ -1141,14 +1166,200 @@ IMAGE_SEND_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 CDN_UPLOAD_MAX_RETRIES = 3
 
 
-def _encrypt_aes_ecb(data: bytes, key: bytes) -> bytes:
-    """AES-128-ECB with PKCS7 padding via openssl (see _decrypt_aes_ecb)."""
-    proc = subprocess.run(
-        ["openssl", "enc", "-aes-128-ecb", "-K", key.hex()],
-        input=data, capture_output=True, timeout=30)
+# --- AES-128-ECB backends -------------------------------------------------
+# stdlib has no AES. Preferred: cryptography (pip install cryptography).
+# Next: libcrypto via ctypes (no new dependency, no key on a command
+# line). Last resort: the openssl CLI, whose -K argument exposes the
+# media key to other local users via ps for the lifetime of the child
+# process; that fallback logs a one-time warning. The key is per-file,
+# so a leak affects only that one media file, but prefer cryptography.
+
+_AES_BACKEND = None
+_AES_WARNED = False
+
+
+def _aes_backend():
+    global _AES_BACKEND, _AES_WARNED
+    if _AES_BACKEND is not None:
+        return _AES_BACKEND
+    try:
+        import cryptography  # noqa: F401
+        _AES_BACKEND = "cryptography"
+    except ImportError:
+        try:
+            import ctypes.util
+            _AES_BACKEND = ("ctypes" if ctypes.util.find_library("crypto")
+                            else "openssl")
+        except Exception:  # noqa: BLE001
+            _AES_BACKEND = "openssl"
+    if _AES_BACKEND == "openssl" and not _AES_WARNED:
+        _AES_WARNED = True
+        try:
+            log("AES backend: openssl CLI (key visible in process list "
+                "to local users; pip install cryptography to avoid)")
+        except Exception:  # noqa: BLE001
+            pass
+    return _AES_BACKEND
+
+
+def _aes_cryptography(data: bytes, key: bytes, encrypt: bool) -> bytes:
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import (
+        Cipher, algorithms, modes)
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    if encrypt:
+        padder = padding.PKCS7(128).padder()
+        data = padder.update(data) + padder.finalize()
+        ctx = cipher.encryptor()
+        return ctx.update(data) + ctx.finalize()
+    ctx = cipher.decryptor()
+    plain = ctx.update(data) + ctx.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(plain) + unpadder.finalize()
+
+
+_EVP_LIB = None
+
+
+def _evp_lib():
+    global _EVP_LIB
+    if _EVP_LIB is not None:
+        return _EVP_LIB
+    import ctypes
+    import ctypes.util
+    lib = ctypes.CDLL(ctypes.util.find_library("crypto"))
+    lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+    lib.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+    lib.EVP_aes_128_ecb.restype = ctypes.c_void_p
+    for prefix in ("Encrypt", "Decrypt"):
+        getattr(lib, f"EVP_{prefix}Init_ex").argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_char_p, ctypes.c_char_p]
+        getattr(lib, f"EVP_{prefix}Update").argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+            ctypes.c_char_p, ctypes.c_int]
+        getattr(lib, f"EVP_{prefix}Final_ex").argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    _EVP_LIB = lib
+    return lib
+
+
+def _aes_ctypes(data: bytes, key: bytes, encrypt: bool) -> bytes:
+    import ctypes
+    lib = _evp_lib()
+    ctx = lib.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise MediaError("decrypt" if not encrypt else "encrypt", "EVP context allocation failed")
+    try:
+        init = lib.EVP_EncryptInit_ex if encrypt else lib.EVP_DecryptInit_ex
+        update = lib.EVP_EncryptUpdate if encrypt else lib.EVP_DecryptUpdate
+        final = lib.EVP_EncryptFinal_ex if encrypt else lib.EVP_DecryptFinal_ex
+        if init(ctx, lib.EVP_aes_128_ecb(), None, key, None) <= 0:
+            raise MediaError("decrypt" if not encrypt else "encrypt", "EVP init failed")
+        out = ctypes.create_string_buffer(len(data) + 32)
+        outlen = ctypes.c_int(0)
+        if update(ctx, ctypes.addressof(out), ctypes.byref(outlen),
+                  data, len(data)) <= 0:
+            raise MediaError("decrypt" if not encrypt else "encrypt", "EVP update failed")
+        n = outlen.value
+        fin = ctypes.create_string_buffer(32)
+        finlen = ctypes.c_int(0)
+        if final(ctx, ctypes.addressof(fin), ctypes.byref(finlen)) <= 0:
+            raise MediaError("decrypt" if not encrypt else "encrypt", "EVP final failed (bad padding?)")
+        return out.raw[:n] + fin.raw[:finlen.value]
+    finally:
+        lib.EVP_CIPHER_CTX_free(ctx)
+
+
+def _aes_bytes(data: bytes, key: bytes, encrypt: bool) -> bytes:
+    backend = _aes_backend()
+    if backend == "cryptography":
+        return _aes_cryptography(data, key, encrypt)
+    if backend == "ctypes":
+        return _aes_ctypes(data, key, encrypt)
+    args = ["openssl", "enc", "-aes-128-ecb", "-K", key.hex()]
+    if not encrypt:
+        args.insert(2, "-d")
+    proc = subprocess.run(args, input=data, capture_output=True, timeout=30)
     if proc.returncode != 0:
-        raise ApiError("network", "media encrypt failed")
+        raise MediaError("decrypt" if not encrypt else "encrypt", "openssl AES failed")
     return proc.stdout
+
+
+def _aes_stream(src: Path, key: bytes, dst: Path, encrypt: bool) -> None:
+    """Streaming AES file transform (constant memory) for the
+    cryptography and ctypes backends; openssl handles files itself."""
+    backend = _aes_backend()
+    if backend == "openssl":
+        args = ["openssl", "enc", "-aes-128-ecb", "-K", key.hex(),
+                "-in", str(src), "-out", str(dst)]
+        if not encrypt:
+            args.insert(2, "-d")
+        proc = subprocess.run(args, capture_output=True, timeout=300)
+        if proc.returncode != 0:
+            raise MediaError("decrypt" if not encrypt else "encrypt", "openssl AES file failed")
+        return
+    if backend == "cryptography":
+        from cryptography.hazmat.primitives import padding
+        from cryptography.hazmat.primitives.ciphers import (
+            Cipher, algorithms, modes)
+        cipher = Cipher(algorithms.AES(key), modes.ECB())
+        ctx = cipher.encryptor() if encrypt else cipher.decryptor()
+        padder = padding.PKCS7(128).padder() if encrypt else None
+        unpadder = padding.PKCS7(128).unpadder() if not encrypt else None
+        with open(src, "rb") as f, open(dst, "wb") as out:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                if encrypt:
+                    out.write(ctx.update(padder.update(chunk)))
+                else:
+                    out.write(unpadder.update(ctx.update(chunk)))
+            if encrypt:
+                out.write(ctx.update(padder.finalize()) + ctx.finalize())
+            else:
+                out.write(unpadder.update(ctx.finalize())
+                          + unpadder.finalize())
+        return
+    import ctypes
+    lib = _evp_lib()
+    ctx = lib.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise MediaError("decrypt" if not encrypt else "encrypt", "EVP context allocation failed")
+    try:
+        init = lib.EVP_EncryptInit_ex if encrypt else lib.EVP_DecryptInit_ex
+        update = lib.EVP_EncryptUpdate if encrypt else lib.EVP_DecryptUpdate
+        final = lib.EVP_EncryptFinal_ex if encrypt else lib.EVP_DecryptFinal_ex
+        if init(ctx, lib.EVP_aes_128_ecb(), None, key, None) <= 0:
+            raise MediaError("decrypt" if not encrypt else "encrypt", "EVP init failed")
+        out = ctypes.create_string_buffer(65536 + 32)
+        outlen = ctypes.c_int(0)
+        with open(src, "rb") as f, open(dst, "wb") as w:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                if update(ctx, ctypes.addressof(out), ctypes.byref(outlen),
+                          chunk, len(chunk)) <= 0:
+                    raise MediaError("decrypt" if not encrypt else "encrypt", "EVP update failed")
+                w.write(out.raw[:outlen.value])
+            fin = ctypes.create_string_buffer(32)
+            finlen = ctypes.c_int(0)
+            if final(ctx, ctypes.addressof(fin), ctypes.byref(finlen)) <= 0:
+                raise MediaError("decrypt" if not encrypt else "encrypt", "EVP final failed (bad padding?)")
+            w.write(fin.raw[:finlen.value])
+    finally:
+        lib.EVP_CIPHER_CTX_free(ctx)
+
+
+def _encrypt_aes_ecb(data: bytes, key: bytes) -> bytes:
+    """AES-128-ECB with PKCS7 padding (cryptography, else libcrypto
+    via ctypes, else the openssl CLI)."""
+    try:
+        return _aes_bytes(data, key, True)
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("network", "media encrypt failed") from e
 
 
 def _aes_ecb_padded_size(n: int) -> int:
@@ -1181,13 +1392,11 @@ CDN_RETRY_DELAYS_SEC = (1, 3)
 
 
 def _encrypt_aes_ecb_file(src: Path, key: bytes, dst: Path) -> None:
-    """File-to-file AES-128-ECB (PKCS7) via openssl: constant memory."""
-    proc = subprocess.run(
-        ["openssl", "enc", "-aes-128-ecb", "-K", key.hex(),
-         "-in", str(src), "-out", str(dst)],
-        capture_output=True, timeout=300)
-    if proc.returncode != 0:
-        raise ApiError("business", "media encrypt failed")
+    """File-to-file AES-128-ECB (PKCS7), streaming, constant memory."""
+    try:
+        _aes_stream(src, key, dst, True)
+    except Exception as e:  # noqa: BLE001
+        raise ApiError("business", "media encrypt failed") from e
 
 
 def _cdn_post_file(url: str, path: Path, size: int) -> tuple[int, dict, bytes]:
@@ -1254,7 +1463,7 @@ def _upload_media_to_cdn(creds: dict, path: Path, to_user_id: str,
     upload_full_url = (resp.get("upload_full_url") or "").strip()
     upload_param = resp.get("upload_param") or ""
     if upload_full_url:
-        cdn_url = upload_full_url
+        cdn_url = _validate_server_url(upload_full_url, "upload")
     elif upload_param:
         # Fallback construction, mirroring the download URL pattern
         # (<cdn>/download?encrypted_query_param=...); upload_full_url
@@ -2595,10 +2804,29 @@ class MediaError(ApiError):
         self.info = info
 
 
+def _validate_server_url(url: str, what: str) -> str:
+    """Allowlist for URLs the server hands us (media downloads, CDN
+    uploads): https on Tencent CDN suffixes (qq.com, qpic.cn, qlogo.cn)
+    only. The server is trusted, but a compromised or spoofed response
+    must not turn the bridge into an SSRF client against arbitrary hosts.
+    Tests may set WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1 to allow loopback URLs."""
+    parts = urllib.parse.urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "https" and any(
+            host == suf or host.endswith("." + suf)
+            for suf in ("qq.com", "qpic.cn", "qlogo.cn")):
+        return url
+    if (os.environ.get("WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL") == "1"
+            and host in ("127.0.0.1", "::1", "localhost")):
+        return url
+    raise MediaError("bad_url",
+                     f"{what} URL not allowed: {parts.scheme}://{host}")
+
+
 def _media_url(media: dict, what: str) -> str:
     url = media.get("full_url")
     if url:
-        return url
+        return _validate_server_url(url, what)
     eqp = media.get("encrypt_query_param")
     if not eqp:
         raise MediaError("no_ref", f"{what} item has no CDN reference")
@@ -2752,14 +2980,9 @@ def _fetch_decrypt(url: str, key: bytes, tmp_path: Path, plain_path: Path,
 
 
 def _decrypt_aes_ecb_file(src: Path, key: bytes, dst: Path) -> None:
-    """File-to-file AES-128-ECB decrypt via openssl (streaming, so a
+    """File-to-file AES-128-ECB decrypt (streaming, so a
     100MB video never sits in RAM three times over)."""
-    proc = subprocess.run(
-        ["openssl", "enc", "-d", "-aes-128-ecb", "-K", key.hex(),
-         "-in", str(src), "-out", str(dst)],
-        capture_output=True, timeout=180)
-    if proc.returncode != 0:
-        raise MediaError("decrypt", "media decrypt failed")
+    _aes_stream(src, key, dst, False)
 
 
 def _md5_file(path: Path) -> str:
@@ -2771,14 +2994,13 @@ def _md5_file(path: Path) -> str:
 
 
 def _decrypt_aes_ecb(data: bytes, key: bytes) -> bytes:
-    """AES-128-ECB with PKCS7 unpadding via the openssl CLI (stdlib has
-    no AES). Raises ApiError on failure."""
-    proc = subprocess.run(
-        ["openssl", "enc", "-d", "-aes-128-ecb", "-K", key.hex()],
-        input=data, capture_output=True, timeout=30)
-    if proc.returncode != 0:
-        raise MediaError("decrypt", "media decrypt failed")
-    return proc.stdout
+    """AES-128-ECB with PKCS7 unpadding. Raises MediaError on failure."""
+    try:
+        return _aes_bytes(data, key, False)
+    except MediaError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise MediaError("decrypt", "media decrypt failed") from e
 
 
 def _sniff_image_ext(data: bytes) -> str:
@@ -2895,9 +3117,10 @@ def download_video(video_item: dict, mid: str) -> dict:
     thumb = video_item.get("thumb_media") or {}
     if thumb.get("encrypt_query_param") or thumb.get("full_url"):
         try:
-            turl = thumb.get("full_url") or (
-                f"{CDN_BASE_URL}/download?encrypted_query_param="
-                f"{urllib.parse.quote(thumb.get('encrypt_query_param') or '', safe='')}")
+            turl = (_validate_server_url(thumb["full_url"], "thumb")
+                    if thumb.get("full_url") else
+                    f"{CDN_BASE_URL}/download?encrypted_query_param="
+                    f"{urllib.parse.quote(thumb.get('encrypt_query_param') or '', safe='')}")
             traw = _fetch_bytes(turl)
             tdata = _decrypt_aes_ecb(traw, key)
             if tdata:
@@ -4109,7 +4332,8 @@ def history_search_command(needle: str) -> str:
 def recent_files_command() -> str:
     """Opt batch item 5: recent files, read only from on-disk records.
     Sent files come from the media queue (name/bytes/finished_at), received
-    media from inbox_media, archives from icloud-upload. Never guesses."""
+    media from inbox_media, archives from the local archive folder
+    (WECHAT_BRIDGE_ARCHIVE_DIR, default icloud-upload/). Never guesses."""
     entries = []  # (mtime_ms, label, size)
     try:
         for f in QUEUE_DIR.glob("*.json"):
@@ -4130,7 +4354,9 @@ def recent_files_command() -> str:
     except OSError:
         pass
     try:
-        for f in (BASE_DIR / "icloud-upload").glob("*"):
+        archive_dir = BASE_DIR / os.environ.get(
+            "WECHAT_BRIDGE_ARCHIVE_DIR", "icloud-upload")
+        for f in archive_dir.glob("*"):
             if f.is_file() and f.suffix != ".txt":
                 entries.append((int(f.stat().st_mtime * 1000),
                                 f"归档包：{f.name}", f.stat().st_size))
@@ -5712,7 +5938,7 @@ def sender_loop() -> None:
 # Observed 2026-11-01: an 18 s MP3 the executor generated failed with
 # "CDN upload RemoteDisconnected" three times in a row and the user had to
 # say "send it again" later. This egress drops connections in bursts
-# (OPS.md: cut after ~1-1.5 s, in clusters); v3 retried the CDN POST 3 times
+# (docs/OPERATIONS.md: cut after ~1-1.5 s, in clusters); v3 retried the CDN POST 3 times
 # within ~5 s - all inside the same burst. Now every outbound file is a
 # queue item under outbox/queue/ with a private copy under outbox/files/
 # (the executor's /tmp does not survive a VM replacement, ~/workspace does):

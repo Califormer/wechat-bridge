@@ -147,6 +147,22 @@ If you use Muse as the executor, `hooks/` contains the companion polling hook:
 Without Muse, the CLI alone is enough: `claim` / `progress` / `complete`
 are the entire interface between an executor and the bridge.
 
+## Security notes (summary; full version in SECURITY.md)
+
+- **Proxies are http:// only**: the pool speaks plaintext CONNECT, never TLS
+  to the proxy itself, and does not speak SOCKS. With an https/socks proxy
+  configured, the pool disables itself with a clear log line; do not assume
+  it took over.
+- **Server URL allowlist**: download/upload URLs handed by the server must be
+  https on Tencent CDN suffixes (`*.qq.com`, `*.qpic.cn`, `*.qlogo.cn`). Tests may set `WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1` to
+  allow loopback addresses.
+- **AES backend**: cryptography first, system libcrypto second, openssl CLI
+  last (the key is briefly visible in ps on fallback, with a warning logged;
+  installing cryptography avoids it).
+- **Do not run the service as root**: set `User=USERNAME` in the template to
+  a dedicated user or your own login user. `MemoryMax=2G`, `RestartSec=5`,
+  `WantedBy=multi-user.target`.
+
 ## Environment variables (common)
 
 | Variable | Default | Meaning |

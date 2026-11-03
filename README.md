@@ -125,6 +125,17 @@ systemctl status wechat-bridge
 不用 Muse 也可以只用上面的 CLI：`claim` / `progress` / `complete`
 就是执行者与桥接之间的全部接口。
 
+## 安全说明（摘要，完整版见 SECURITY.md）
+
+- **代理只支持 http://**：桥接的代理池只会发明文 CONNECT，不会给代理本身做 TLS，
+  也不支持 SOCKS；配了 https/socks 代理时池子会停用并记一条明确日志，不要误以为已接管。
+- **服务端 URL 白名单**：服务端给的下载/上传地址只放行 https 的腾讯 CDN 域名（`*.qq.com`、`*.qpic.cn`、`*.qlogo.cn`），
+  测试时可用 `WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1` 放行本地回环地址。
+- **AES 后端**：优先 cryptography，没有时用系统 libcrypto，都没有才回退 openssl 命令行
+  （密钥会在 ps 里短暂可见，回退时会记一条警告；装上 cryptography 即可避免）。
+- **服务不要跑在 root 下**：模板里 `User=USERNAME` 请换成专用用户或你自己的登录用户，
+  `MemoryMax=2G`、`RestartSec=5`、`WantedBy=multi-user.target`。
+
 ## 环境变量（常用）
 
 | 变量 | 默认 | 说明 |

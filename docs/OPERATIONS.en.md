@@ -89,3 +89,14 @@ python3 ops/report.py --days 1
 - `observed_limits`: the server's actually observed reply limit. Empty
   means not observed yet, and 10 remains the default; do not probe it with
   dummy messages, that would spam the owner's own WeChat.
+
+## Proxy and media security (since v5.0.1)
+
+- The proxy pool supports http:// CONNECT proxies only; https/socks proxies
+  disable the pool with a log line. Do not mistake "pool disabled, urllib
+  fallback" for a working proxy.
+- Server-provided download/upload URLs must be https on Tencent CDN suffixes (`*.qq.com`, `*.qpic.cn`, `*.qlogo.cn`);
+  everything else is refused. Local tests may set
+  `WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1` to allow loopback addresses.
+- AES prefers cryptography, then system libcrypto, then the openssl CLI
+  fallback (which logs a warning; install cryptography on production hosts).

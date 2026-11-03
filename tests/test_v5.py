@@ -52,7 +52,7 @@ class Fake:
         name = ep.rsplit("/", 1)[1]
         self.calls.append(name)
         if name == "getuploadurl":
-            return {"upload_full_url": "https://cdn.invalid/u"}
+            return {"upload_full_url": "https://cdn.qq.com/u"}
         if name != "sendmessage":
             return {"ret": 0}
         if self.minus2 is not None:

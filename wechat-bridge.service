@@ -26,19 +26,22 @@ WorkingDirectory=/home/USERNAME/workspace/wechat-bridge
 ExecStart=/usr/bin/python3 /home/USERNAME/workspace/wechat-bridge/bridge.py serve
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
-RestartSec=2
+RestartSec=5
 TimeoutStopSec=20
 KillMode=control-group
-# Hardening that cannot break the bridge (it only writes under ~/workspace).
-# It still runs as root because the hook installs and restarts this unit;
-# see OPS.md (v5) before adding User=.
+# Do NOT run as root unless you have a reason: create a dedicated user
+# (or use your own login user) and put it in User= below. If a hook needs
+# to restart this unit, give that user passwordless sudo for
+# "systemctl restart/reload wechat-bridge" only, or run the hook as the
+# same user. See docs/OPERATIONS.md before changing the user.
+User=USERNAME
 NoNewPrivileges=yes
 ProtectSystem=full
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LimitNOFILE=4096
-MemoryMax=1G
+MemoryMax=2G
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

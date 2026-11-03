@@ -73,3 +73,12 @@ python3 ops/report.py --days 1
   时间，不是桥的速度。
 - `observed_limits`：服务端实际允许的回复条数，空表示还没观测到，
   10 仍是默认值；不要用假消息去探测它，那会骚扰机主自己的微信。
+
+## 代理与媒体安全（v5.0.1 起）
+
+- 代理池只支持 http:// CONNECT 代理；https/socks 代理会停用池子并记日志，
+  不要把“池子已停用、走 urllib 回退”当成已接管。
+- 服务端给的下载/上传地址只放行 https 的腾讯 CDN 域名（`*.qq.com`、`*.qpic.cn`、`*.qlogo.cn`），其余一律拒绝；
+  本地测试用 `WECHAT_BRIDGE_MEDIA_ALLOW_LOCAL=1` 放行回环地址。
+- AES 优先 cryptography，其次系统 libcrypto，都没有才回退 openssl 命令行
+  （回退时记警告；生产机建议装 cryptography）。

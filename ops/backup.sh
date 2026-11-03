@@ -9,7 +9,7 @@
 #
 # Usage:
 #   ops/backup.sh              create a snapshot (retention: newest 5 dated
-#                              snapshots + named snapshots, see OPS.md;
+#                              snapshots + named snapshots, see docs/OPERATIONS.md;
 #                              excess dated snapshots are NEVER auto-deleted)
 #   ops/backup.sh --prune-list   list dated snapshots beyond the newest 5
 #                              that still hold non-state files (state-only
@@ -19,8 +19,8 @@
 #                              NON-STATE files of the snapshots listed by
 #                              --prune-list; state/ copies are ALWAYS kept.
 #                              This is only the local deletion step AFTER
-#                              the iCloud upload + byte-verify flow in
-#                              OPS.md, never a substitute for it.
+#                              the cloud-drive upload + byte-verify flow in
+#                              docs/OPERATIONS.md, never a substitute for it.
 #                              Named snapshots (pre-*, opt*, *.v4-*) are
 #                              never touched by any prune
 #   ops/backup.sh --list       list snapshots
@@ -31,10 +31,14 @@
 #                              but deliberately NOT rolled back)
 set -euo pipefail
 
-BRIDGE_DIR="$HOME/workspace/wechat-bridge"
+# Project root defaults to this script's parent dir; override with env
+# when the checkout lives elsewhere. HOOKS_DIR/CRON_SRC are optional
+# platform integrations (Muse hook + hourly cron); unset means skip.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_DIR="${BRIDGE_DIR:-$(dirname "$SCRIPT_DIR")}"
 BACKUPS="$BRIDGE_DIR/backups"
-HOOKS_DIR="$HOME/hooks"
-CRON_SRC="$HOME/workspace/goals/clawbot/crons/hourly/wechat-bridge-health__interval@1h.md"
+HOOKS_DIR="${HOOKS_DIR:-$HOME/hooks}"
+CRON_SRC="${WECHAT_BRIDGE_CRON_SRC:-}"
 
 mkdir -p "$BACKUPS"
 chmod 700 "$BACKUPS"
@@ -71,8 +75,8 @@ case "${1:-}" in
     CANDIDATES="$(prune_candidates || true)"
     if [[ -z "$CANDIDATES" ]]; then echo "[backup] none; nothing to prune"; exit 0; fi
     echo "$CANDIDATES"
-    echo "[backup] NOTE: prune only deletes non-state files, AFTER the iCloud"
-    echo "[backup] upload + byte-verify flow in OPS.md. state/ is always kept."
+    echo "[backup] NOTE: prune only deletes non-state files, AFTER the cloud-drive"
+    echo "[backup] upload + byte-verify flow in docs/OPERATIONS.md. state/ is always kept."
     echo "[backup] total snapshot first (backups/ itself, before any deletion):"
     TOTAL="$BACKUPS/.total-before-prune-$(snap_date).tar.gz"
     tar -czf "$TOTAL" -C "$BACKUPS" --exclude='.total-before-prune-*.tar.gz' . 2>/dev/null || true
@@ -138,12 +142,12 @@ case "${1:-}" in
     mkdir -p "$DST/hooks"
     cp "$HOOKS_DIR/scripts/wechat-bridge-inbox.sh" "$DST/hooks/" 2>/dev/null || true
     cp "$HOOKS_DIR/definitions/wechat-bridge-inbox.json" "$DST/hooks/" 2>/dev/null || true
-    [[ -f "$CRON_SRC" ]] && cp "$CRON_SRC" "$DST/health-cron.md" || true
+    [[ -n "$CRON_SRC" && -f "$CRON_SRC" ]] && cp "$CRON_SRC" "$DST/health-cron.md" || true
     find "$DST" -type f -exec chmod 600 {} +
-    # Retention (OPS.md, 2026-11-02 rule): newest 5 dated snapshots +
+    # Retention (docs/OPERATIONS.md, 2026-11-02 rule): newest 5 dated snapshots +
     # named snapshots; excess dated snapshots are NOT auto-deleted here.
     # Run --prune-list to see them; --prune deletes only their non-state
-    # files, after a total snapshot and after the iCloud upload flow.
+    # files, after a total snapshot and after the cloud-drive upload flow.
     EXCESS="$(prune_candidates || true)"
     if [[ -n "$EXCESS" ]]; then
       echo "[backup] dated snapshots beyond newest 5 (kept, not auto-deleted):"

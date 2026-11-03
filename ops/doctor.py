@@ -25,8 +25,10 @@ LOGS = BASE / "logs"
 UNIT_PATH = Path("/etc/systemd/system/wechat-bridge.service")
 UNIT_CANON = BASE / "wechat-bridge.service"
 HOOK_DEF = Path.home() / "hooks" / "definitions" / "wechat-bridge-inbox.json"
-CRON_DEF = (Path.home() / "workspace" / "goals" / "clawbot" / "crons"
-            / "hourly" / "wechat-bridge-health__interval@1h.md")
+# Optional platform integration (Muse hourly cron definition). Set
+# WECHAT_BRIDGE_CRON_DEF to a definition file to check it; unset = skip.
+_cron_env = os.environ.get("WECHAT_BRIDGE_CRON_DEF")
+CRON_DEF = Path(_cron_env) if _cron_env else None
 
 results = []
 
@@ -256,21 +258,29 @@ def check_watchers() -> None:
     else:
         add("hook", "PASS",
             f"wechat-bridge-inbox enabled, poll={hook.get('poll_interval_secs')}s")
-    if CRON_DEF.exists():
+    if CRON_DEF is None:
+        add("hourly_cron", "WARN",
+            "hourly cron not configured (optional platform integration)")
+    elif CRON_DEF.exists():
         add("hourly_cron", "PASS", "health cron definition present")
     else:
         add("hourly_cron", "WARN",
-            "health cron definition file not found under goal workspace")
+            "configured health cron definition file not found")
 
 
 def check_deps() -> None:
-    """v4: what a fresh VM image may lack. openssl is required (all media
-    crypto); ffmpeg and a SILK codec are optional (voice notes, video
-    frames) and degrade gracefully - voice requests then go out as files."""
+    """v4: what a fresh VM image may lack. An AES backend is required
+    (cryptography, libcrypto, or the openssl CLI); ffmpeg and a SILK codec
+    are optional (voice notes, video frames) and degrade gracefully -
+    voice requests then go out as files."""
+    import ctypes.util as _ctu
     import importlib.util
     import shutil as _sh
-    if not _sh.which("openssl"):
-        add("deps", "FAIL", "openssl missing: no media can be encrypted/decrypted")
+    if (not _sh.which("openssl")
+            and importlib.util.find_spec("cryptography") is None
+            and not _ctu.find_library("crypto")):
+        add("deps", "FAIL",
+            "no AES backend: install cryptography, libcrypto, or openssl")
         return
     vend = BASE / "vendor" / "py"
     if vend.is_dir():

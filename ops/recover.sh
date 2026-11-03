@@ -2,7 +2,7 @@
 # One-click recovery ("一键恢复") - after a VM replacement, or any time the
 # WeChat channel is down and the hook is not fixing it by itself.
 # The hook normally re-installs the unit and restarts the service within
-# seconds (OPS.md: measured 24 s); this script is the manual path for when
+# seconds (docs/OPERATIONS.md: measured 24 s); this script is the manual path for when
 # the hook itself is down, and it also re-checks what a fresh VM image may
 # lack. Never touches credentials or tasks.
 #   1. dependencies: python3 + openssl (required), ffmpeg + SILK codec (optional)

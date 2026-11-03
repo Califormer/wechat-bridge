@@ -53,7 +53,7 @@ class FakeILink:
         if name == "getuploadurl":
             if self.upload_ret is not None:
                 return self.upload_ret
-            return {"upload_full_url": f"https://cdn.invalid/upload?n={len(self.calls)}"}
+            return {"upload_full_url": f"https://cdn.qq.com/upload?n={len(self.calls)}"}
         if name == "sendmessage":
             item = body["msg"]["item_list"][0]
             if self.refuse_voice and item["type"] == 3:
@@ -305,7 +305,7 @@ def g_queue():
     detail = ""
     if HAVE_OLD:
         o = load("q_old", OLD)
-        o.bot_post = lambda c, ep, body, timeout: {"upload_full_url": "https://cdn.invalid/u"}
+        o.bot_post = lambda c, ep, body, timeout: {"upload_full_url": "https://cdn.qq.com/u"}
         o.CDN_RETRY_DELAYS_SEC = (0.01, 0.01)
         drops = {"n": 5}
 
