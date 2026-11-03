@@ -1,5 +1,31 @@
 # 更新日志
 
+## v5.0.4（开源包修正，2026-11-03；尚未发布、尚未回灌线上桥）
+
+- 重定向守卫补测试：此前没有任何测试碰 `_SafeRedirectHandler`（
+  proxy_failover 只确认回退路径走了 build_opener，删掉守卫也不会
+  红）。新增 tests/test_redirect_guard.py，用本地 A→B 服务器实测
+  池模式与回退模式：跨域白名单目标剥 Authorization/Cookie、跨域
+  非白名单拒绝、同域保留凭据、https→http 降级拒绝；已用阉割版
+  反向验证新测试会红。
+- 跨域重定向被拒的异常统一：回退路径此前把白名单拒绝包成
+  URLError，下载循环便当成网络错误重试 6 次再报网络中断；现与
+  池路径一致，改为 MediaError（确定性失败，不重试，原始错误交
+  执行者）。降级拒绝在两模式本来就是 URLError，保持不变。
+- state/DECISIONS.md 改 0600 原子写：此前 `decisions --add` 直接
+  write_text（本机实测 0660，与 state 下其他 0600 文件不一致），
+  现新增 atomic_write_text（临时文件 + chmod + rename），中断不
+  会留半截文件。
+- 坏密文改 4097 字节：原固定全零 4096 块的注释把密文字节和填充
+  字节混为一谈；固定密钥下才确定报错，随机密钥实测约 0.5% 不
+  报错。4097 不是 16 的倍数，长度本身即错，与密钥无关。
+- CI 矩阵防塌缩：两任务各加后端断言（job1 要求 cryptography
+  不可导入且后端为 ctypes；job2 要求后端为 cryptography），
+  test_open_fixes 循环已装的全部后端（cryptography/ctypes/openssl
+  CLI）跑向量与坏长度文件。
+- CHANGELOG 整理：v5.0.3 的 CI 过程记录（运行号、提交号、上传
+  插曲）压成一行。
+
 ## v5.0.3（开源包修正，2026-11-03；同日已发布并回灌线上桥）
 
 - 更正 v5.0.2 的说法：那版的旧决定回退只接进了 claim，`decisions` 显示
@@ -18,18 +44,7 @@
   原先"全部离线测试"不准确）；测试分两遍跑，一遍装 cryptography、
   一遍不装（上轮 bug 只在装了时出现）；补 `permissions: contents: read`
   与 `timeout-minutes`。
-- CI 后续（测试侧修正）：运行 #6 中 test-cryptography 已绿，test 仍红在
-  test_proxy_failover 检查 4——v5.0.3 的 urllib 重定向守卫把停用池的
-  回退路径从直接 urlopen 改成了 build_opener(_SafeRedirectHandler).open，
-  而该检查仍靠 monkeypatch urlopen 来探测直通，导致探测点失效（本地
-  同样复现，非 runner 环境差异；先前回归结论误读了输出尾行，漏看了
-  检查 4 的失败）。修正：检查改 intercept build_opener 路径；桥代码
-  行为本身未变，_SafeRedirectHandler 的行为由 open_fixes 测试覆盖。
-- CI 修复（工作流提交 796f1a4）：首个 CI 运行因 runner 缺 ffmpeg 而失败
-  （两任务同因：g_voice 生成音频时找不到 ffmpeg；本机有 ffmpeg 所以
-  本地测不出来），工作流两任务补装 ffmpeg。注意：工作流文件只能走
-  网页端维护（连接器令牌无 workflow 权限），且授权上传曾因新旧文件
-  大小记录不一致失败，改走编辑器粘贴。
+- CI：工作流补装 ffmpeg、修正 proxy 检查后运行全绿（工作流文件须走网页端维护）。
 - 测试稳定性：test_open_fixes 的坏密文改成固定全零块（原来 urandom
   4096 字节有 1/256 概率最后一字节恰为 0x01、填充合法而误报）；
   test_v5_e2e 的 SIGHUP 检查改为送达后再等一个代理隧道出现（切换

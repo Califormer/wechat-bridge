@@ -89,13 +89,54 @@ except Exception:
 # (cryptography used to leak a raw ValueError here, skipping the
 # FILE_DECRYPT_HINT mapping and the resume-redownload branch).
 d2 = Path(tempfile.mkdtemp(prefix="wb-aes-bad-"))
-(d2 / "bad.bin").write_bytes(b"\x00" * 4096)  # fixed block: pad byte 0x00 is never valid PKCS7
+(d2 / "bad.bin").write_bytes(b"\x00" * 4097)  # 4097 is not a multiple of
+# the 16-byte block size, so the length itself is invalid on every backend,
+# independent of the key (a fixed 4096-byte block only failed deterministically
+# because the test key is fixed: with random keys ~0.5% of decryptions pass
+# padding by chance, since the ciphertext bytes are not the padding bytes)
 try:
     b._decrypt_aes_ecb_file(d2 / "bad.bin", key, d2 / "bad.out")
     check(False, "file decrypt failure raises")
 except Exception as e:
     check(isinstance(e, b.MediaError) and getattr(e, "reason", None) == "decrypt",
           f"file decrypt failure is MediaError decrypt (backend={b._aes_backend()})")
+
+# 5. Every available AES backend must behave the same. This guards the CI
+# matrix: job 1 (no cryptography) must exercise ctypes, job 2 must exercise
+# cryptography, and the openssl CLI backend (never the auto-detected one on
+# a normal machine) gets exercised whenever the binary exists. Forcing the
+# module global works because _aes_bytes/_aes_stream read it per call.
+import ctypes.util
+import shutil
+available = []
+try:
+    import cryptography  # noqa: F401
+    available.append("cryptography")
+except ImportError:
+    pass
+if ctypes.util.find_library("crypto"):
+    available.append("ctypes")
+if shutil.which("openssl"):
+    available.append("openssl")
+check(bool(available), "at least one AES backend available",
+      f"found={available}")
+for backend in available:
+    m = load(HERE / "bridge.py", f"open_fixes_{backend}")
+    m._AES_BACKEND = backend
+    enc = m._encrypt_aes_ecb(plain, key)
+    check(enc[:16].hex() == "69c4e0d86a7b0430d8cdb78070b4c55a"
+          and len(enc) == 32, f"AES vector via {backend}")
+    check(m._decrypt_aes_ecb(enc, key) == plain,
+          f"AES roundtrip via {backend}")
+    d3 = Path(tempfile.mkdtemp(prefix="wb-aes-bad-"))
+    (d3 / "bad.bin").write_bytes(b"\x00" * 4097)
+    try:
+        m._decrypt_aes_ecb_file(d3 / "bad.bin", key, d3 / "bad.out")
+        check(False, f"bad-length file rejected via {backend}")
+    except Exception as e:
+        check(isinstance(e, m.MediaError)
+              and getattr(e, "reason", None) == "decrypt",
+              f"bad-length file is MediaError decrypt via {backend}")
 
 print()
 if fails:

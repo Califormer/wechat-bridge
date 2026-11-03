@@ -183,6 +183,28 @@ def atomic_write_json(path: Path, data, mode=0o600, fsync: bool = True) -> None:
         raise
 
 
+def atomic_write_text(path: Path, text: str, mode=0o600,
+                      fsync: bool = True) -> None:
+    """atomic_write_json for plain text (e.g. DECISIONS.md): tmp file in
+    the same directory, chmod, then rename, so a mid-write interruption
+    never leaves a half-written file behind."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(
+        path.suffix + f".tmp{os.getpid()}.{threading.get_ident()}.{next(_tmp_seq)}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def read_json(path: Path, default=None):
     try:
         with open(path, encoding="utf-8") as f:
@@ -752,8 +774,10 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     (used when the pool is disabled, e.g. https/socks proxies). The
     stdlib handler copies every header cross-origin, so without this
     an API Bearer token would leak to the redirect target. Validation
-    failures surface as URLError, which every caller already maps to
-    a network error."""
+    failures surface as MediaError (exactly like the pool path), so
+    callers treat a refused redirect as deterministic instead of
+    retrying it as a transient network error. The https->http
+    downgrade refusal stays URLError in both paths."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         old = urllib.parse.urlsplit(req.full_url)
@@ -764,11 +788,8 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         old_origin = (old.scheme, old.hostname, old.port)
         new_origin = (new.scheme, new.hostname, new.port)
         if old_origin != new_origin:
-            try:
-                _validate_server_url(
-                    urllib.parse.urljoin(req.full_url, newurl), "redirect")
-            except MediaError as e:
-                raise urllib.error.URLError(str(e)) from e
+            _validate_server_url(
+                urllib.parse.urljoin(req.full_url, newurl), "redirect")
             stripped = {k: req.headers.pop(k) for k in list(req.headers)
                         if k.lower() in ("authorization", "cookie",
                                          "proxy-authorization")}
@@ -7734,8 +7755,7 @@ def cmd_decisions(args) -> int:
             text = text.replace(marker, entry + marker, 1)
         else:
             text = text.rstrip() + "\n\n## 进行中\n" + entry
-        DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        DECISIONS_FILE.write_text(text, encoding="utf-8")
+        atomic_write_text(DECISIONS_FILE, text)
         print(json.dumps({"ok": True, "added": item}, ensure_ascii=False))
         return 0
     print(text, end="")
