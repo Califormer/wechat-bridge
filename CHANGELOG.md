@@ -1,6 +1,6 @@
 # 更新日志
 
-## v5.0.2（开源包修正，2026-11-03；尚未发布、尚未回灌线上桥）
+## v5.0.2（开源包修正，2026-11-03；同日已发布并回灌线上桥）
 
 - `.gitignore` 锚定：`bridge.py.v*` 和 `wechat-bridge.service.v*` 前加 `/`，
   否则 fresh clone 里 `git add -A` 会漏掉 `tests/fixtures/bridge.py.v1/.v3`
@@ -18,6 +18,8 @@
   堵住可信域名上的开放重定向把请求带到任意 https 主机。
 - SECURITY.md：私人联系渠道写明为仓库 Security 标签页的私人漏洞报告。
 - 新增 CI：GitHub Actions 跑全部离线测试（含 e2e）与夹具守门检查。
+  注：CI 文件因连接器令牌无 workflow 权限，改由网页端单独创建（提交 c7e8301），
+  后续连接器推送须继续排除该文件；线上回灌见线上 CHANGELOG 的 v5.0.2 条目。
 
 
 ## v5.0.1（开源包修正，2026-11-03；同日已回灌线上桥）
