@@ -13,7 +13,7 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_v3 as h  # noqa: E402  fixtures only: load/mk_task/set_creds/cli
 
-NEW, OLD = HERE / "bridge.py", HERE / "archive-old-versions" / "bridge.py.v3"
+NEW, OLD = HERE / "bridge.py", HERE / "tests" / "fixtures" / "bridge.py.v3"
 HAVE_OLD = OLD.exists()
 TMP = Path(tempfile.mkdtemp(prefix="v4t-"))
 fails = []

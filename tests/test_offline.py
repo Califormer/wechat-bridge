@@ -58,7 +58,9 @@ def test_heartbeat_threads():
     ok("heartbeat: 8 threads x150 updates, no errors, no lost fields")
 
     # same hammer on the ORIGINAL code, to show the bug was real
-    o = load(HERE / "archive-old-versions" / "bridge.py.v1", "b_old")
+    # (v1 fixture lives in tests/fixtures/ in the published repo;
+    # archive-old-versions/ on a live checkout holds the same file)
+    o = load(HERE / "tests" / "fixtures" / "bridge.py.v1", "b_old")
     errs2 = []
     def worker2(i):
         try:
@@ -100,7 +102,7 @@ def test_index_semantics():
 def test_index_bench():
     n = 2000
     res = {}
-    for name, src in (("old", HERE / "archive-old-versions" / "bridge.py.v1"), ("new", HERE / "bridge.py")):
+    for name, src in (("old", HERE / "tests" / "fixtures" / "bridge.py.v1"), ("new", HERE / "bridge.py")):
         b = load(src, "b_" + name)
         for i in range(1, n + 1):
             mk_task(b, i, status="sent")
