@@ -332,6 +332,14 @@ def g_claim_wait():
           f"claim --wait: the warm executor has the follow-up {dt:.1f}s after it began waiting (no hook "
           "tick, no cold start); its waiter file keeps the hook from waking another")
 
+    # 2026-11-06: a burst is coalesced by serve's batch (state/pending.json,
+    # 3 s pause) - the claim-side settle window is gone - so this part runs
+    # with batching on, as serve does. k1 is answered first (it would
+    # otherwise be pulled into the burst's batch: still unanswered).
+    complete(b, "k1", result="收到。")
+    n0 = len(f.texts())
+    b.batching_on()
+
     def burst():
         time.sleep(0.3)
         say(b, "k2", "第一句", "T2")
@@ -341,9 +349,11 @@ def g_claim_wait():
     th.start()
     rc, out = claim(b, wait=5, settle_ms=800)
     th.join()
+    b.batching_on(False)
     rc2, out2 = complete(b, "k3", result="两句一起回答。", merge_ids="k2")
     check([x["message_id"] for x in out["tasks"]] == ["k2", "k3"] and "merge_hint" in out
-          and out2.get("merged") == ["k2"] and b.load_task("k2")["status"] == "sent" and len(f.texts()) == 1,
+          and out2.get("merged") == ["k2"] and b.load_task("k2")["status"] == "sent"
+          and len(f.texts()) == n0 + 1,
           "a burst of two messages is claimed together with a merge_hint; complete --merge-ids answers "
           "both with ONE reply (one reply slot, one coherent answer)")
 
@@ -436,6 +446,13 @@ def g_resume():
         err = type(e).__name__
     have = dst.stat().st_size if dst.exists() else 0
     b._fetch_to_file(url, dst, 10, 10 ** 8)
+    # 2026-11-06: the stand-in adds to `served` AFTER it has written the body, so the client can
+    # finish reading first; wait for the counter (<= 2 s) instead of racing it (2 of 60 runs failed
+    # on the unmodified s8fix package, tests only).
+    for _ in range(100):
+        if srv.served == len(data) - have:
+            break
+        time.sleep(0.02)
     resumed = dst.read_bytes() == data and srv.ranges[-1] == f"bytes={have}-" and srv.served == len(data) - have
     srv.honor = False
     dst.write_bytes(b"junk" * 100)
@@ -601,11 +618,13 @@ def g_auto_progress_stages():
 
 # ---------------------------------------------------------------- hook
 HOOK = HERE / "hooks/wechat-bridge-inbox.sh"
+# wake() exits like the real hook runtime (2026-11-05 audit §8-1: a stub that
+# returned let the hook's post-wake woke=1 run here, while live it never ran).
 RUNTIME = r'''
 hook_state_get() { [[ -f "$HOOK_STATE" ]] && cat "$HOOK_STATE" || echo '{}'; }
 hook_state_set() { printf '%s' "$1" > "$HOOK_STATE"; }
 log()    { echo "LOG $1" >> "$HOOK_EVENTS"; }
-wake()   { echo "WAKE $1 $(printf '%s' "$2" | tr -d ' \n')" >> "$HOOK_EVENTS"; }
+wake()   { echo "WAKE $1 $(printf '%s' "$2" | tr -d ' \n')" >> "$HOOK_EVENTS"; exit 0; }
 silent() { echo "SILENT $1" >> "$HOOK_EVENTS"; exit 0; }
 '''
 

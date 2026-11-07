@@ -25,12 +25,14 @@ LOGS = BASE / "logs"
 UNIT_PATH = Path("/etc/systemd/system/wechat-bridge.service")
 UNIT_CANON = BASE / "wechat-bridge.service"
 HOOK_DEF = Path.home() / "hooks" / "definitions" / "wechat-bridge-inbox.json"
-# Optional platform integration (Muse hourly cron definition). Set
-# WECHAT_BRIDGE_CRON_DEF to a definition file to check it; unset = skip.
+# Optional override; default is this deployment's real cron definition.
 _cron_env = os.environ.get("WECHAT_BRIDGE_CRON_DEF")
-CRON_DEF = Path(_cron_env) if _cron_env else None
+CRON_DEF = Path(_cron_env) if _cron_env else (Path.home() / "workspace" / "goals" / "clawbot" / "crons"
+            / "hourly" / "wechat-bridge-health__interval@1h.md")
 
 results = []
+PROXY_VAR_NAMES = {"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                   "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"}
 
 
 def add(name: str, status: str, detail: str = "") -> None:
@@ -71,18 +73,36 @@ def check_credentials() -> None:
 def check_proxy_env() -> None:
     env_f = STATE / "proxy.env"
     if not env_f.exists():
-        add("proxy_env", "FAIL", "state/proxy.env missing - serve cannot egress")
+        # v5 also runs without a proxy (direct keep-alive pool): a missing
+        # file is only a fault when serve is not polling OK without it.
+        hb = load_json(STATE / "heartbeat.json") or {}
+        last = int(hb.get("last_poll_ok_at") or 0)
+        if hb.get("transport_mode") == "direct" and last \
+                and int(time.time() * 1000) - last < 180_000:
+            add("proxy_env", "PASS", "no proxy.env: direct mode, polling OK")
+        else:
+            add("proxy_env", "FAIL", "state/proxy.env missing and serve is not "
+                "polling OK without a proxy")
         return
     if (env_f.stat().st_mode & 0o777) != 0o600:
         add("proxy_env", "WARN", f"permissions {mode_str(env_f)}, want 0600")
     file_vars = {}
     for line in env_f.read_text(encoding="utf-8").splitlines():
         line = line.strip()
+        if not line or line.startswith("#"):
+            continue
         if line.startswith("export "):
             line = line[7:]
         if "=" in line:
             k, v = line.split("=", 1)
             file_vars[k.strip()] = v.strip().strip('"').strip("'")
+    # 2026-11-04 review: proxy.env is the EnvironmentFile of a ROOT service;
+    # anything but proxy variables there (LD_PRELOAD=, PYTHONPATH=, ...) runs
+    # with root's rights at the next start.
+    extra = sorted(k for k in file_vars if k not in PROXY_VAR_NAMES)
+    if extra:
+        add("proxy_env_vars", "FAIL", f"proxy.env sets non-proxy variables {extra}: "
+            "remove them (bridge.py write-proxy-env only writes proxy variables)")
     amb = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
     file_https = file_vars.get("HTTPS_PROXY") or file_vars.get("https_proxy") or ""
     if not file_https:
@@ -258,14 +278,11 @@ def check_watchers() -> None:
     else:
         add("hook", "PASS",
             f"wechat-bridge-inbox enabled, poll={hook.get('poll_interval_secs')}s")
-    if CRON_DEF is None:
-        add("hourly_cron", "WARN",
-            "hourly cron not configured (optional platform integration)")
-    elif CRON_DEF.exists():
+    if CRON_DEF.exists():
         add("hourly_cron", "PASS", "health cron definition present")
     else:
         add("hourly_cron", "WARN",
-            "configured health cron definition file not found")
+            "health cron definition file not found under goal workspace")
 
 
 def check_deps() -> None:
@@ -417,17 +434,30 @@ def check_transport() -> None:
             f"DNS fallbacks {hb.get('net_dns_fallbacks') or 0}")
 
 
+_STATS: dict = {}
+
+
+def bridge_stats():
+    """`bridge.py stats`, run once per doctor run (check_scale and
+    check_latency_tail both read it); None when it cannot be read."""
+    if "v" not in _STATS:
+        try:
+            _STATS["v"] = json.loads(run("python3", str(BASE / "bridge.py"), "stats"))
+        except Exception:  # noqa: BLE001
+            _STATS["v"] = None
+    return _STATS["v"]
+
+
 def check_scale() -> None:
     """2026-11-02 六-5: one scale line (inbox / history / archives /
     quote rows / backups / claim context chars, via bridge.py stats).
     Informational only: always PASS unless stats itself is unreadable,
     so growth never masquerades as a fault."""
-    out = run("python3", str(BASE / "bridge.py"), "stats")
-    try:
-        sc = json.loads(out).get("scale") or {}
-    except Exception:
+    st = bridge_stats()
+    if st is None:
         add("scale", "WARN", "bridge.py stats unreadable")
         return
+    sc = st.get("scale") or {}
     add("scale", "PASS",
         f"inbox={sc.get('inbox_files')} files {sc.get('inbox_bytes', 0)//1024}KB, "
         f"history={sc.get('history_lines')} lines, "
@@ -435,6 +465,192 @@ def check_scale() -> None:
         f"quotes={sc.get('quote_rows')} rows, "
         f"backups={sc.get('backup_entries')} entries {sc.get('backup_bytes', 0)//1024}KB, "
         f"claim_context~{sc.get('claim_context_chars')} chars")
+
+
+def check_latency_tail() -> None:
+    """2026-11-05 (Step 0): the long tail in one line - to_first_call max
+    (and its task), total / exec p95 and how many samples - so an outlier
+    like test 2-3's 132 s first progress is visible in doctor, not only in
+    `stats`. Information only: latency is decided by the model, not a
+    health signal of the bridge, so this line is always PASS and never
+    turns WARN or FAIL however slow the numbers are (an unreadable stats
+    is already reported by check_scale)."""
+    st = bridge_stats()
+    if st is None:
+        add("latency_tail", "PASS", "info only: no data (bridge.py stats unreadable, see scale)")
+        return
+    lat = st.get("latency_ms") or {}
+    tf = ((st.get("evidence") or {}).get("exec") or {}).get("to_first_call") or {}
+    top = ((((st.get("evidence") or {}).get("exec") or {}).get("to_first_call_top")) or [{}])[0]
+
+    def sec(ms):
+        return "-" if ms is None else f"{ms / 1000:.1f}s"
+    who = f" (task {top['task_id']})" if tf.get("max") is not None and top.get("task_id") else ""
+    add("latency_tail", "PASS",
+        f"info only, never a FAIL: to_first_call max {sec(tf.get('max'))}{who}, n={tf.get('n') or 0}; "
+        f"total p95 {sec((lat.get('total') or {}).get('p95'))}, exec p95 "
+        f"{sec((lat.get('exec') or {}).get('p95'))}, n={lat.get('n') or 0} "
+        f"(stats window 72 h; one task: wb stats --task-id <id>)")
+
+
+def check_pipeline() -> None:
+    """2026-11-04 review heartbeat fields: messages that cannot be stored
+    (the cursor is held back until they can), long polls that get no answer
+    at all, and serve worker threads that stopped looping."""
+    hb = load_json(STATE / "heartbeat.json") or {}
+    fail, warn = [], []
+    n = int(hb.get("ingest_fail_streak") or 0)
+    if n >= 3:
+        fail.append(f"inbound messages cannot be stored ({n} polls in a row - disk full?)")
+    elif n:
+        warn.append(f"inbound store failed {n}x (retrying)")
+    n = int(hb.get("client_timeout_streak") or 0)
+    if n >= 3:
+        warn.append(f"{n} long polls in a row got no answer at all")
+    ages = hb.get("threads_age_s") or {}
+    stuck = sorted(k for k, v in ages.items()
+                   if isinstance(v, (int, float)) and v > 1800)
+    if stuck:
+        warn.append("worker threads not looping for >30 min: " + ", ".join(stuck))
+    status = "FAIL" if fail else ("WARN" if warn else "PASS")
+    add("pipeline", status, "; ".join(fail + warn)
+        or "ingest, long polls and worker threads OK")
+
+
+def check_decisions() -> None:
+    f = STATE / "DECISIONS.md"
+    if not f.exists():
+        f = BASE / "DECISIONS.md"
+    try:
+        n = len(f.read_text(encoding="utf-8"))
+    except OSError:
+        add("decisions", "PASS", "no decision list")
+        return
+    budget = int(os.environ.get("WECHAT_BRIDGE_DECISIONS_CHARS") or 3000)
+    if n > budget:
+        add("decisions", "WARN", f"decision list is {n} chars (claim budget {budget}): "
+            "finished/回灌 sections are left out of claims first - move done items out")
+    else:
+        add("decisions", "PASS", f"{n}/{budget} chars")
+
+
+def check_relay() -> None:
+    """2026-11-07 长任务接力: plans stay private (state/plans 0700, files
+    0600) and no relay leg sits waiting for an executor - the hook should
+    wake one within a poll or two of `complete --continue`."""
+    pdir = STATE / "plans"
+    if not pdir.is_dir():
+        add("relay", "PASS", "no long-task plans")
+        return
+    problems, n, waiting = [], 0, []
+    try:
+        if pdir.stat().st_mode & 0o077:
+            problems.append("state/plans is not 0700")
+    except OSError:
+        pass
+    now = int(time.time() * 1000)
+    for f in sorted(pdir.glob("*.json")):
+        n += 1
+        try:
+            if f.stat().st_mode & 0o077:
+                problems.append(f"{f.name} is not 0600")
+        except OSError:
+            continue
+        t = load_json(INBOX / f.name)
+        if isinstance(t, dict) and t.get("relay_pending") \
+                and t.get("status") == "pending_execution" \
+                and now - int(t.get("pending_at") or now) > 120_000:
+            waiting.append(f.stem)
+    if waiting:
+        problems.append(f"{len(waiting)} relay leg(s) waiting > 2 min for an executor "
+                        f"(hook not waking?): {', '.join(waiting[:3])}")
+    if problems:
+        add("relay", "WARN", "; ".join(problems))
+    else:
+        add("relay", "PASS", f"{n} plan file(s), all private; no relay leg waiting")
+
+
+def check_background() -> None:
+    """2026-11-07 v1.4 后台长任务: queue private (state/long-tasks 0700, entries
+    0600), the watch hook alive (it touches .watch_tick every run; without it
+    the bridge keeps long tasks in the foreground relay), nothing queued past
+    the take timeout, no running job silent past the stale limit."""
+    lt = STATE / "long-tasks"
+    q = lt / "queue"
+    problems, counts = [], {}
+    tick = lt / ".watch_tick"
+    try:
+        age = time.time() - tick.stat().st_mtime
+        if age > 120:
+            problems.append(f"watch hook last ran {int(age)} s ago (long tasks stay in the foreground relay)")
+    except OSError:
+        problems.append("watch hook has not run: register hooks/wechat-long-task-watch "
+                        "(until then long tasks use the foreground relay)")
+    for d in (lt, q):
+        try:
+            if d.exists() and d.stat().st_mode & 0o077:
+                problems.append(f"{d.name} is not 0700")
+        except OSError:
+            pass
+    now = int(time.time() * 1000)
+    running = sum(1 for f in (q.glob("*.json") if q.is_dir() else [])
+                  if (load_json(f) or {}).get("state") == "running")
+    for f in sorted(q.glob("*.json")) if q.is_dir() else []:
+        try:
+            if f.stat().st_mode & 0o077:
+                problems.append(f"{f.name} is not 0600")
+        except OSError:
+            continue
+        e = load_json(f) or {}
+        st = e.get("state") or "?"
+        counts[st] = counts.get(st, 0) + 1
+        # v1.7: a requeued task waits since its requeue, not its first queueing
+        since = max(int(e.get("queued_at") or now), int(e.get("requeued_at") or 0))
+        if st == "queued" and now - since > 11 * 60_000:
+            mins = int((now - since) / 60000)      # v1.6: always shown (WARN only)
+            problems.append(f"{f.stem} queued {mins} min, "
+                            + (f"waiting behind {running} running task(s)" if running else "not taken"))
+        if st == "running" and now - int(e.get("heartbeat_at") or now) > 31 * 60_000:
+            problems.append(f"{f.stem} running but silent {int((now - int(e['heartbeat_at'])) / 60000)} min")
+    if problems:
+        add("background", "WARN", "; ".join(problems[:5]) + f" queue={counts}")
+    else:
+        add("background", "PASS", f"watch hook alive; queue={counts or 'empty'}; all private")
+
+
+def check_quote_routing() -> None:
+    """v1.7, information only (never FAIL): which way a quote of a bridge
+    message can be routed on this account. sendmessage returns a server id only
+    since protocol 2.4.9 and some accounts never echo - then the bridge's own
+    messages are known by client id and text only, and a quote of the
+    "已转到后台" signal routes by its quoted text (long-tasks show:
+    last_quote_lookup.via = text)."""
+    import sqlite3
+    db = BASE / "history" / "quotes.db"
+    if not db.exists():
+        add("quote_routing", "PASS", "quote store empty (no message sent yet)")
+        return
+    since = int(time.time() * 1000) - 7 * 86_400_000
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            out, sid = conn.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN id NOT LIKE 'cid:%' THEN 1 ELSE 0 END) "
+                "FROM msgs WHERE dir='out' AND at>=?", (since,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        add("quote_routing", "WARN", f"quote store unreadable ({type(e).__name__})")
+        return
+    out, sid = int(out or 0), int(sid or 0)
+    led = load_json(STATE / "echo_ledger.json") or {}
+    echoed = sum(1 for r in led.values() if isinstance(r, dict) and r.get("echo_at"))
+    looks = load_json(STATE / "long-tasks" / "quote_lookups.json") or []
+    last = looks[-1] if isinstance(looks, list) and looks else {}
+    mode = ("by server id" if sid else "by echo id" if echoed else "by quoted text only")
+    add("quote_routing", "PASS",
+        f"7 d: {out} bridge messages, {sid} with a server id, {echoed} echoes -> quotes route {mode}"
+        + (f"; last lookup via={last.get('via')} found={last.get('found')}" if last else ""))
 
 
 def main() -> int:
@@ -454,6 +670,12 @@ def main() -> int:
     check_log_tail()
     check_restarts()
     check_scale()
+    check_latency_tail()
+    check_pipeline()
+    check_decisions()
+    check_relay()
+    check_background()
+    check_quote_routing()
     fails = sum(1 for r in results if r["status"] == "FAIL")
     warns = sum(1 for r in results if r["status"] == "WARN")
     if "--json" in sys.argv:

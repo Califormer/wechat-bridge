@@ -1,0 +1,13 @@
+{
+ "version": 1,
+ "id": "wechat-long-task-watch",
+ "enabled": true,
+ "script_path": "~/hooks/scripts/wechat-long-task-watch.sh",
+ "prompt": "你只负责传话，不做任务本身：你是 hook 拉起的单回合 worker，受 600 秒限制。wake 的 payload 是微信桥交到后台队列、等主代理接手的长任务（reason=wechat_long_task）。不要执行任务，不要调用桥的 claim / complete / long-tasks，也不要给微信发消息。你的执行总结会送到主聊天，主代理看到后接手，所以总结只写下面这段（把 <> 换成 payload 里的内容）：\n\n微信桥后台长任务待接手（<count> 条）：<每条一行：id 和 text>。请主代理按 ~/workspace/wechat-bridge/BACKGROUND.md 处理：`cd ~/workspace/wechat-bridge && python3 wb long-tasks take <id>` 接手 → 生成子代理在后台做（中间产物写 workdir，每步 `long-tasks progress` 报阶段）→ 子代理交回结果后 `python3 wb long-tasks finish <id> --token <token> --result-file <结果>`，只发这一条最终结果；做不成用 `long-tasks fail`。",
+ "poll_interval_secs": 10,
+ "script_timeout_secs": 60,
+ "delivery": {
+  "surface": "main"
+ },
+ "presentation_locale": "zh-CN"
+}

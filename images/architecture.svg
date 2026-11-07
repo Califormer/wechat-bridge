@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="540" viewBox="0 0 800 540" font-family="sans-serif">
+<style>
+  .box { fill: #f6f8fa; stroke: #0969da; stroke-width: 1.5; rx: 8; }
+  .box-green { fill: #dafbe1; stroke: #1a7f37; stroke-width: 1.5; rx: 8; }
+  .box-amber { fill: #fff8c5; stroke: #9a6700; stroke-width: 1.5; rx: 8; }
+  .box-grey { fill: #f6f8fa; stroke: #57606a; stroke-width: 1.5; rx: 8; }
+  .title { font-size: 15px; font-weight: bold; fill: #1f2328; }
+  .sub { font-size: 12px; fill: #57606a; }
+  .arrow { stroke: #0969da; stroke-width: 2; fill: none; marker-end: url(#ah); }
+  .alabel { font-size: 11px; fill: #0969da; }
+  .wall { font-size: 12px; font-weight: bold; fill: #cf222e; }
+  .note { font-size: 11px; fill: #57606a; }
+</style>
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0969da"/></marker></defs>
+<rect x="30" y="20" width="240" height="90" class="box-green"/>
+<text x="150.0" y="42" text-anchor="middle" class="title">WeChat (your phone)</text>
+<text x="150.0" y="62" text-anchor="middle" class="sub">send text / voice / image / file</text>
+<text x="150.0" y="79" text-anchor="middle" class="sub">quote-reply to add requirements</text>
+<rect x="530" y="20" width="240" height="90" class="box-green"/>
+<text x="650.0" y="42" text-anchor="middle" class="title">WeChat (your phone)</text>
+<text x="650.0" y="62" text-anchor="middle" class="sub">receive the reply</text>
+<text x="650.0" y="79" text-anchor="middle" class="sub">one final result per task</text>
+<rect x="230" y="170" width="340" height="130" class="box"/>
+<text x="400.0" y="192" text-anchor="middle" class="title">WeChat Bridge  bridge.py</text>
+<text x="400.0" y="212" text-anchor="middle" class="sub">5s poll  ·  24h window + reply quota</text>
+<text x="400.0" y="229" text-anchor="middle" class="sub">long-reply chunking  ·  media send/recv</text>
+<text x="400.0" y="246" text-anchor="middle" class="sub">claim / progress / complete / heartbeat</text>
+<rect x="230" y="360" width="340" height="130" class="box-amber"/>
+<text x="400.0" y="382" text-anchor="middle" class="title">Executor  (Muse / your script)</text>
+<text x="400.0" y="402" text-anchor="middle" class="sub">runs real tools: files, code, web</text>
+<text x="400.0" y="419" text-anchor="middle" class="sub">long tasks: relay or background</text>
+<text x="400.0" y="436" text-anchor="middle" class="sub">reports progress, delivers one result</text>
+<path d="M150,110 L350,170" class="arrow"/>
+<text x="250" y="155" text-anchor="middle" class="alabel">official openclaw-weixin</text>
+<path d="M620,110 L420,170" class="arrow"/>
+<text x="520" y="155" text-anchor="middle" class="alabel">official openclaw-weixin</text>
+<path d="M400,300 L400,360" class="arrow"/>
+<text x="400" y="335" text-anchor="middle" class="alabel">hook wakes executor (5s poll)</text>
+<path d="M570,425 L570,300" class="arrow"/>
+<text x="660" y="370" text-anchor="middle" class="alabel">complete → bridge sends back</text>
+<text x="400" y="520" text-anchor="middle" class="note">Bridge only moves messages and task state. It holds no model and makes no decisions.</text>
+</svg>

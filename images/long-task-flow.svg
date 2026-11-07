@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="520" viewBox="0 0 800 520" font-family="sans-serif">
+<style>
+  .box { fill: #f6f8fa; stroke: #0969da; stroke-width: 1.5; rx: 8; }
+  .box-green { fill: #dafbe1; stroke: #1a7f37; stroke-width: 1.5; rx: 8; }
+  .box-amber { fill: #fff8c5; stroke: #9a6700; stroke-width: 1.5; rx: 8; }
+  .box-grey { fill: #f6f8fa; stroke: #57606a; stroke-width: 1.5; rx: 8; }
+  .title { font-size: 15px; font-weight: bold; fill: #1f2328; }
+  .sub { font-size: 12px; fill: #57606a; }
+  .arrow { stroke: #0969da; stroke-width: 2; fill: none; marker-end: url(#ah); }
+  .alabel { font-size: 11px; fill: #0969da; }
+  .wall { font-size: 12px; font-weight: bold; fill: #cf222e; }
+  .note { font-size: 11px; fill: #57606a; }
+</style>
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0969da"/></marker></defs>
+<rect x="30" y="20" width="200" height="70" class="box-green"/>
+<text x="130.0" y="42" text-anchor="middle" class="title">User sends long task</text>
+<text x="130.0" y="62" text-anchor="middle" class="sub">e.g. count lines, refactor,</text>
+<text x="130.0" y="79" text-anchor="middle" class="sub">generate a report</text>
+<rect x="300" y="20" width="200" height="70" class="box"/>
+<text x="400.0" y="42" text-anchor="middle" class="title">Bridge: foreground ack</text>
+<text x="400.0" y="62" text-anchor="middle" class="sub">reply “已转到后台”</text>
+<text x="400.0" y="79" text-anchor="middle" class="sub">queue state/long-tasks/queue/</text>
+<rect x="570" y="20" width="200" height="70" class="box-amber"/>
+<text x="670.0" y="42" text-anchor="middle" class="title">Watch hook (10s poll)</text>
+<text x="670.0" y="62" text-anchor="middle" class="sub">wakes the main agent</text>
+<text x="670.0" y="79" text-anchor="middle" class="sub">main agent takes the task</text>
+<path d="M230,55 L300,55" class="arrow"/>
+<path d="M500,55 L570,55" class="arrow"/>
+<text x="400" y="140" text-anchor="middle" class="wall">Two 10-minute walls — foreground cannot finish a long task</text>
+<text x="400" y="160" text-anchor="middle" class="note">executor turn is killed at 600s  ·  bridge reclaims after 10 min without a heartbeat</text>
+<rect x="30" y="200" width="360" height="110" class="box"/>
+<text x="210.0" y="222" text-anchor="middle" class="title">Relay  (v1.3+)</text>
+<text x="210.0" y="242" text-anchor="middle" class="sub">plan: steps ≤ 7 min, ≤ 20 steps</text>
+<text x="210.0" y="259" text-anchor="middle" class="sub">complete --continue hands to next turn</text>
+<text x="210.0" y="276" text-anchor="middle" class="sub">max 8 legs / 60 min</text>
+<rect x="410" y="200" width="360" height="110" class="box"/>
+<text x="590.0" y="222" text-anchor="middle" class="title">Background  (v1.4+)</text>
+<text x="590.0" y="242" text-anchor="middle" class="sub">main agent spawns a sub-agent</text>
+<text x="590.0" y="259" text-anchor="middle" class="sub">sub-agent works, reports progress</text>
+<text x="590.0" y="276" text-anchor="middle" class="sub">max 240 min work · 30 min stale → requeue</text>
+<path d="M400,90 L210,200" class="arrow"/>
+<path d="M400,90 L590,200" class="arrow"/>
+<rect x="230" y="360" width="340" height="80" class="box-green"/>
+<text x="400.0" y="382" text-anchor="middle" class="title">One final result</text>
+<text x="400.0" y="402" text-anchor="middle" class="sub">finish → bridge sends it back</text>
+<text x="400.0" y="419" text-anchor="middle" class="sub">exactly one reply per task</text>
+<path d="M210,310 L350,360" class="arrow"/>
+<path d="M590,310 L450,360" class="arrow"/>
+<text x="400" y="480" text-anchor="middle" class="note">Quote the “已转到后台” signal to add requirements — the bridge attaches them to the running task (v1.7).</text>
+<text x="400" y="500" text-anchor="middle" class="note">If nobody takes a queued task in 10 min it returns to the foreground and runs by relay.</text>
+</svg>

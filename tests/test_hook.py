@@ -9,11 +9,13 @@ ROOT = Path(__file__).resolve().parent.parent
 OLD = ROOT / "backups/20261028-030105/hooks/wechat-bridge-inbox.sh"
 NEW = ROOT / "hooks/wechat-bridge-inbox.sh"
 
+# wake() exits like the real hook runtime (2026-11-05 audit §8-1: a stub that
+# returned let the hook's post-wake woke=1 run here, while live it never ran).
 RUNTIME = r'''
 hook_state_get() { [[ -f "$HOOK_STATE" ]] && cat "$HOOK_STATE" || echo '{}'; }
 hook_state_set() { printf '%s' "$1" > "$HOOK_STATE"; }
 log()    { echo "LOG $1" >> "$HOOK_EVENTS"; }
-wake()   { echo "WAKE $1 $(printf '%s' "$2" | tr -d ' \n')" >> "$HOOK_EVENTS"; }
+wake()   { echo "WAKE $1 $(printf '%s' "$2" | tr -d ' \n')" >> "$HOOK_EVENTS"; exit 0; }
 silent() { echo "SILENT $1" >> "$HOOK_EVENTS"; exit 0; }
 '''
 

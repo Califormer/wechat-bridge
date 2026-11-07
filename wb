@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Fast entry point for the bridge CLI (2026-11-05): same commands, options
+and output as `python3 bridge.py ...`, but bridge.py is imported as a module,
+so Python reuses its cached bytecode (__pycache__) instead of recompiling
+~9,000 lines on every call - about 70 ms less per command (see
+tests/bench_latency.py); the agent calls the CLI several times per message.
+Usage: python3 wb claim --limit 5 --wait 45   (./wb ... when executable)
+systemd keeps starting `bridge.py serve` (the hook and doctor look for it).
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import bridge  # noqa: E402
+
+sys.exit(bridge.main())

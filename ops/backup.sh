@@ -9,7 +9,7 @@
 #
 # Usage:
 #   ops/backup.sh              create a snapshot (retention: newest 5 dated
-#                              snapshots + named snapshots, see docs/OPERATIONS.md;
+#                              snapshots + named snapshots, see OPS.md;
 #                              excess dated snapshots are NEVER auto-deleted)
 #   ops/backup.sh --prune-list   list dated snapshots beyond the newest 5
 #                              that still hold non-state files (state-only
@@ -19,8 +19,8 @@
 #                              NON-STATE files of the snapshots listed by
 #                              --prune-list; state/ copies are ALWAYS kept.
 #                              This is only the local deletion step AFTER
-#                              the cloud-drive upload + byte-verify flow in
-#                              docs/OPERATIONS.md, never a substitute for it.
+#                              the iCloud upload + byte-verify flow in
+#                              OPS.md, never a substitute for it.
 #                              Named snapshots (pre-*, opt*, *.v4-*) are
 #                              never touched by any prune
 #   ops/backup.sh --list       list snapshots
@@ -31,14 +31,12 @@
 #                              but deliberately NOT rolled back)
 set -euo pipefail
 
-# Project root defaults to this script's parent dir; override with env
-# when the checkout lives elsewhere. HOOKS_DIR/CRON_SRC are optional
-# platform integrations (Muse hook + hourly cron); unset means skip.
+# Paths are env-overridable; defaults are this deployment's real paths.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_DIR="${BRIDGE_DIR:-$(dirname "$SCRIPT_DIR")}"
 BACKUPS="$BRIDGE_DIR/backups"
 HOOKS_DIR="${HOOKS_DIR:-$HOME/hooks}"
-CRON_SRC="${WECHAT_BRIDGE_CRON_SRC:-}"
+CRON_SRC="${WECHAT_BRIDGE_CRON_SRC:-$HOME/workspace/goals/clawbot/crons/hourly/wechat-bridge-health__interval@1h.md}"
 
 mkdir -p "$BACKUPS"
 chmod 700 "$BACKUPS"
@@ -49,6 +47,7 @@ chmod 700 "$BACKUPS"
 # timezone here unifies both callers; old UTC-stamped snapshots were
 # renamed to their Caracas equivalents in the same batch.
 SNAP_TZ="America/Caracas"
+SNAP_TZ="${WECHAT_BRIDGE_SNAP_TZ:-$SNAP_TZ}"   # other deployments: set their own
 snap_date() { TZ="$SNAP_TZ" date +%Y%m%d-%H%M%S; }
 
 # Dated snapshots beyond the newest 5 that still hold files outside
@@ -75,8 +74,8 @@ case "${1:-}" in
     CANDIDATES="$(prune_candidates || true)"
     if [[ -z "$CANDIDATES" ]]; then echo "[backup] none; nothing to prune"; exit 0; fi
     echo "$CANDIDATES"
-    echo "[backup] NOTE: prune only deletes non-state files, AFTER the cloud-drive"
-    echo "[backup] upload + byte-verify flow in docs/OPERATIONS.md. state/ is always kept."
+    echo "[backup] NOTE: prune only deletes non-state files, AFTER the iCloud"
+    echo "[backup] upload + byte-verify flow in OPS.md. state/ is always kept."
     echo "[backup] total snapshot first (backups/ itself, before any deletion):"
     TOTAL="$BACKUPS/.total-before-prune-$(snap_date).tar.gz"
     tar -czf "$TOTAL" -C "$BACKUPS" --exclude='.total-before-prune-*.tar.gz' . 2>/dev/null || true
@@ -126,7 +125,26 @@ case "${1:-}" in
           "$DST/state/serve_starts.json"
     # Slim (2026-11-02): runtime transient files are useless for rollback.
     rm -f "$DST/state/"*.lock "$DST/state/serve.pid" \
-          "$DST/state/.hook_full_scan" "$DST/state/.hook_scan_mark"
+          "$DST/state/.hook_full_scan" "$DST/state/.hook_scan_mark" \
+          "$DST/state/.inbox_signal"
+    # 2026-11-05 audit (§8-2): the hook's tick log is a diagnostic, never
+    # restored, and changes every 5 s (so the hard-link dedup below never
+    # applies). Now that it keeps 24 h (up to 1 MiB), copying it into every
+    # hourly snapshot - kept forever - would add ~15-20 MB a day.
+    rm -f "$DST/state/hook_ticks.log" "$DST/state/hook_ticks.log.tmp"
+    # 2026-11-06: the batch index and the failed-text outbox describe what is
+    # in flight right now - the bridge recovers both from the inbox/ task
+    # files (batch_recover / text_outbox_sync; inbox/ is not backed up
+    # either) - and outbox.json holds reply TEXT, while snapshots are kept
+    # forever.
+    # v1.7: task_index.json is a rebuildable cache of inbox/ - not worth a snapshot
+    rm -f "$DST/state/pending.json" "$DST/state/outbox.json" "$DST/state/task_index.json"
+    # 2026-11-07 (长任务接力): state/plans holds in-flight long-task plans and
+    # their work files (copies of what a task is processing) - not snapshotted.
+    # (find -delete: tests/test_tail_20261102.py forbids recursive rm in this script)
+    if [ -d "$DST/state/plans" ]; then find "$DST/state/plans" -depth -delete; fi
+    # 2026-11-07 v1.4: the background queue and its work dirs - in flight, not snapshotted
+    if [ -d "$DST/state/long-tasks" ]; then find "$DST/state/long-tasks" -depth -delete; fi
     cp "$BRIDGE_DIR/wechat-bridge.service" "$DST/" 2>/dev/null || true
     cp "$BRIDGE_DIR/bridge.py" "$DST/" 2>/dev/null || true
     # Slim (2026-11-02): if bridge.py is unchanged vs the newest dated
@@ -139,15 +157,28 @@ case "${1:-}" in
         ln "$BACKUPS/$PREV/bridge.py" "$DST/bridge.py"
       fi
     fi
+    # 2026-11-04 review: the same for unchanged state/ files. Every hourly
+    # snapshot keeps a complete state/ (the standing rule) but no longer a
+    # new physical copy of credentials.json / token_history.json each time:
+    # unchanged files are hard links to the previous snapshot's copy.
+    if [[ -n "$PREV" && -d "$BACKUPS/$PREV/state" ]]; then
+      while IFS= read -r -d '' f; do
+        rel="${f#"$DST/state/"}"
+        old="$BACKUPS/$PREV/state/$rel"
+        if [[ -f "$old" && ! -L "$old" ]] && cmp -s "$old" "$f"; then
+          ln -f "$old" "$f" 2>/dev/null || true
+        fi
+      done < <(find "$DST/state" -type f -print0)
+    fi
     mkdir -p "$DST/hooks"
     cp "$HOOKS_DIR/scripts/wechat-bridge-inbox.sh" "$DST/hooks/" 2>/dev/null || true
     cp "$HOOKS_DIR/definitions/wechat-bridge-inbox.json" "$DST/hooks/" 2>/dev/null || true
-    [[ -n "$CRON_SRC" && -f "$CRON_SRC" ]] && cp "$CRON_SRC" "$DST/health-cron.md" || true
+    [[ -f "$CRON_SRC" ]] && cp "$CRON_SRC" "$DST/health-cron.md" || true
     find "$DST" -type f -exec chmod 600 {} +
-    # Retention (docs/OPERATIONS.md, 2026-11-02 rule): newest 5 dated snapshots +
+    # Retention (OPS.md, 2026-11-02 rule): newest 5 dated snapshots +
     # named snapshots; excess dated snapshots are NOT auto-deleted here.
     # Run --prune-list to see them; --prune deletes only their non-state
-    # files, after a total snapshot and after the cloud-drive upload flow.
+    # files, after a total snapshot and after the iCloud upload flow.
     EXCESS="$(prune_candidates || true)"
     if [[ -n "$EXCESS" ]]; then
       echo "[backup] dated snapshots beyond newest 5 (kept, not auto-deleted):"

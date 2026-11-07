@@ -48,6 +48,7 @@ def main() -> int:
     if not message:
         print(json.dumps({"ok": False, "error": "empty message"}, ensure_ascii=False))
         return 2
+    bridge.apply_private_umask()
     creds = bridge.load_creds()
     if not creds:
         print(json.dumps({"ok": False, "error": "no credentials"}, ensure_ascii=False))

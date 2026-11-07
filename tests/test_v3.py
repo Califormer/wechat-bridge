@@ -393,7 +393,7 @@ def g_send():
 
 # ---------------------------------------------------------------- 3 CDN upload
 def g_cdn():
-    d = Path(tempfile.mkdtemp())
+    d = Path(tempfile.mkdtemp(prefix="v3-"))   # 2026-11-05 §8-4: was unprefixed (tmp*)
     small = d / "a.jpg"
     small.write_bytes(os.urandom(300_000))
     creds = {"bot_token": "t"}
