@@ -170,10 +170,12 @@ try:
     t_claim = time.time()
     claimed = json.loads(out.strip().splitlines()[-1])
     typing_at = next((t for t, st in srv.typing if st == 1), None)
-    check([x["message_id"] for x in claimed["tasks"]] == ["m1"] and t_claim - t_push < 3.0
+    # 2026-11-06: a message is dispatched after the batch pause (3 s without
+    # a new one, state/pending.json) - before it was the 1.2 s claim window.
+    check([x["message_id"] for x in claimed["tasks"]] == ["m1"] and 3.0 <= t_claim - t_push < 5.0
           and typing_at is not None and typing_at - t_push < 1.5,
           f"warm executor (claim --wait) had the message {t_claim - t_push:.1f}s after it was sent "
-          f"(incl. the 1.2s burst settle); 'typing...' shown after "
+          f"(incl. the 3 s batch pause); 'typing...' shown after "
           f"{(typing_at or t_push + 99) - t_push:.2f}s")
 
     # 2. a reply bigger than the budget, with a code block across the parts
